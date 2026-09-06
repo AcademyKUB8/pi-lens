@@ -62,6 +62,7 @@ import { TreeSitterNavigator } from "./tree-sitter-navigator.js";
 import {
 	isProvenSqlAlchemySessionReceiver,
 	isSafePsycopgIdentifierComposition,
+	isSqlAlchemyEntityQueryArgument,
 	isSqlAlchemyStatementArgument,
 	PYTHON_SQLALCHEMY_RECEIVER_NAMES,
 	PYTHON_SQLALCHEMY_STATEMENT_BUILDERS,
@@ -4139,11 +4140,17 @@ export class TreeSitterClient {
 				}
 
 				// #2576: a receiver PROVEN to be a sqlalchemy Session/AsyncSession.
-				// `Session.query` takes entity classes; `Session.execute` takes a
-				// statement object — a builder call, or a name bound to one
-				// (`stmt = select(User)`), which the check above cannot see.
+				// `Session.query` takes entity classes and `Session.execute` a
+				// statement object (a builder call, or a name bound to one —
+				// `stmt = select(User)`, which the check above cannot see). Neither
+				// suppression may swallow composed SQL text (#2577 review F1/F2).
 				if (isProvenSqlAlchemySessionReceiver(receiver, rootNode)) {
-					if (fn === "query") return false;
+					if (
+						fn === "query" &&
+						isSqlAlchemyEntityQueryArgument(sqlNode, rootNode)
+					) {
+						return false;
+					}
 					if (
 						fn === "execute" &&
 						isSqlAlchemyStatementArgument(sqlNode, rootNode)

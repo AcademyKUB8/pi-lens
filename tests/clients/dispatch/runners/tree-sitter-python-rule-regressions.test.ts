@@ -254,6 +254,16 @@ def run(value):
 				"global.py",
 				`from psycopg import sql\ndef run():\n    global sql\n    ${sink}`,
 			],
+			[
+				"nonlocal.py",
+				`from psycopg import sql\ndef outer():\n    def run():\n        nonlocal sql\n        ${sink}\n    return run`,
+			],
+			// A parse error anywhere invalidates the whole summary: provenance
+			// cannot be read off a tree the grammar did not accept (#2577 F4).
+			[
+				"parse-error.py",
+				`from sqlalchemy.orm import Session\nfrom models import User\ndef find(db: Session):\n    return db.query(User)\ndef broken(`,
+			],
 		];
 		const results = await Promise.all(
 			cases.map(([name, source]) =>
@@ -582,6 +592,161 @@ def find(db: Session, tainted):
 			expect
 				.soft(firedRuleIds(result), label)
 				.toContain("python-sql-injection");
+		}
+	}, 30_000);
+	it("keeps composed and opaque Session.query arguments diagnostic (#2577 round 2)", async () => {
+		// F1: a proven Session receiver must not suppress `query` regardless of
+		// what it is handed. `Session.query` takes mapped classes, so an entity
+		// name stays quiet while SQL text or an opaque local value does not.
+		const header = `from sqlalchemy import text
+from sqlalchemy.orm import Session
+from models import User
+
+`;
+		const fires = {
+			"c01 db.query('...' + uid)": env.addFile(
+				"q-c01-concat.py",
+				`${header}def find(db: Session, uid):
+    return db.query("SELECT * FROM t WHERE id=" + uid)
+`,
+			),
+			"c02 db.query(text('...' + uid))": env.addFile(
+				"q-c02-text-concat.py",
+				`${header}def find(db: Session, uid):
+    return db.query(text("SELECT * FROM t WHERE id=" + uid))
+`,
+			),
+			"c03 db.query('...' % uid)": env.addFile(
+				"q-c03-percent.py",
+				`${header}def find(db: Session, uid):
+    return db.query("SELECT * FROM t WHERE id=%s" % uid)
+`,
+			),
+			"c06 db.query(opaque_parameter)": env.addFile(
+				"q-c06-opaque.py",
+				`${header}def find(db: Session, q):
+    return db.query(q)
+`,
+			),
+		};
+		const quiet = {
+			"c04 db.query(User)": env.addFile(
+				"q-c04-entity.py",
+				`${header}def find(db: Session):
+    return db.query(User)
+`,
+			),
+			"c05 db.query(User).filter(...)": env.addFile(
+				"q-c05-entity-filter.py",
+				`${header}def find(db: Session, uid):
+    return db.query(User).filter(User.id == uid).all()
+`,
+			),
+		};
+		const results = await Promise.all(
+			[...Object.entries(fires), ...Object.entries(quiet)].map(
+				async ([label, fixture]) =>
+					[label, await treeSitterRunner.run(fixture.ctx)] as const,
+			),
+		);
+		for (const [label, result] of results) {
+			const expectation = expect.soft(firedRuleIds(result), label);
+			if (label.startsWith("c04") || label.startsWith("c05")) {
+				expectation.not.toContain("python-sql-injection");
+			} else {
+				expectation.toContain("python-sql-injection");
+			}
+		}
+	}, 30_000);
+
+	it("keeps builder-shaped laundering diagnostic (#2577 round 2)", async () => {
+		// F2: an attribute callee counts as a statement builder only when its
+		// object is a proven sqlalchemy import, and no builder call launders a
+		// composed SQL string.
+		const fires = {
+			"w1 db.execute(repo.update('...' + uid))": env.addFile(
+				"b-w1-repo-update.py",
+				`from sqlalchemy.orm import Session
+
+def find(db: Session, repo, uid):
+    return db.execute(repo.update("UPDATE t SET x=" + uid))
+`,
+			),
+			"w2 db.execute(repo.delete('...' + uid))": env.addFile(
+				"b-w2-repo-delete.py",
+				`from sqlalchemy.orm import Session
+
+def find(db: Session, repo, uid):
+    return db.execute(repo.delete("DELETE FROM t WHERE id=" + uid))
+`,
+			),
+			"w3 stmt = repo.update('...' + uid); db.execute(stmt)": env.addFile(
+				"b-w3-bound-repo-update.py",
+				`from sqlalchemy.orm import Session
+
+def find(db: Session, repo, uid):
+    stmt = repo.update("UPDATE t SET x=" + uid)
+    return db.execute(stmt)
+`,
+			),
+			"w5 unproven receiver, repo.update('...' + uid)": env.addFile(
+				"b-w5-unproven-receiver.py",
+				`def find(conn, repo, uid):
+    return conn.execute(repo.update("UPDATE t SET x=" + uid))
+`,
+			),
+			"w7 db.execute(repo.update(value)) — unproven module": env.addFile(
+				"b-w7-repo-update-opaque.py",
+				`from sqlalchemy.orm import Session
+
+def find(db: Session, repo, value):
+    return db.execute(repo.update(value))
+`,
+			),
+			"w6 db.execute(sa.select('...' + uid))": env.addFile(
+				"b-w6-sa-select-concat.py",
+				`import sqlalchemy as sa
+from sqlalchemy.orm import Session
+
+def find(db: Session, uid):
+    return db.execute(sa.select("SELECT * FROM t WHERE id=" + uid))
+`,
+			),
+			"sa.text('...' + uid)": env.addFile(
+				"b-sa-text-concat.py",
+				`import sqlalchemy as sa
+from sqlalchemy.orm import Session
+
+def find(db: Session, uid):
+    return db.execute(sa.text("SELECT * FROM t WHERE id=" + uid))
+`,
+			),
+		};
+		const quiet = {
+			"w4 db.execute(sa.select(User))": env.addFile(
+				"b-w4-sa-select.py",
+				`import sqlalchemy as sa
+from sqlalchemy.orm import Session
+from models import User
+
+def find(db: Session):
+    return db.execute(sa.select(User))
+`,
+			),
+		};
+		const results = await Promise.all(
+			[...Object.entries(fires), ...Object.entries(quiet)].map(
+				async ([label, fixture]) =>
+					[label, await treeSitterRunner.run(fixture.ctx)] as const,
+			),
+		);
+		for (const [label, result] of results) {
+			const expectation = expect.soft(firedRuleIds(result), label);
+			if (label.startsWith("w4")) {
+				expectation.not.toContain("python-sql-injection");
+			} else {
+				expectation.toContain("python-sql-injection");
+			}
 		}
 	}, 30_000);
 });

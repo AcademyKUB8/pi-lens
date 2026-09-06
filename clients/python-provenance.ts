@@ -18,6 +18,7 @@ export interface PythonSyntaxNode {
 
 type PythonProvenance =
 	| "sqlalchemy-session"
+	| "sqlalchemy-module"
 	| "psycopg-package"
 	| "psycopg-sql-module"
 	| "psycopg-sql-constructor"
@@ -46,6 +47,12 @@ export interface PythonProvenanceSummary {
 		reference: PythonSyntaxNode,
 	): PythonProvenance | null;
 	isSqlAlchemySessionReceiver(receiver: PythonSyntaxNode): boolean;
+	/**
+	 * True when the reference resolves to a binding introduced by an enclosing
+	 * function (a parameter or a local): an opaque runtime value, never a
+	 * module-level entity class. Fails closed (true) when nothing is proven.
+	 */
+	isFunctionLocalName(reference: PythonSyntaxNode): boolean;
 	/** The value assigned to `name`, iff `name` is bound exactly once. */
 	singleAssignmentValue(
 		name: string,
@@ -89,6 +96,7 @@ const FROM_IMPORT_PROVENANCE = new Map<string, PythonProvenance>([
 	["psycopg2.sql:Identifier", "psycopg-identifier-constructor"],
 ]);
 const PLAIN_PACKAGE_PROVENANCE = new Map<string, PythonProvenance>([
+	["sqlalchemy", "sqlalchemy-module"],
 	["psycopg", "psycopg-package"],
 	["psycopg2", "psycopg-package"],
 ]);
@@ -611,6 +619,20 @@ class Summary implements PythonProvenanceSummary {
 		return value && value.endIndex <= reference.startIndex ? value : null;
 	}
 
+	isFunctionLocalName(reference: PythonSyntaxNode): boolean {
+		if (this.invalid || reference.type !== "identifier") return true;
+		let current: PythonSyntaxNode | null | undefined = reference.parent;
+		for (let depth = 0; current && depth < ANCESTOR_DEPTH_CAP; depth++) {
+			if (current.type === "function_definition") {
+				const summary = this.functions.get(nodeKey(current));
+				if (!summary) return true;
+				if ((summary.bindingCounts.get(reference.text) ?? 0) > 0) return true;
+			}
+			current = current.parent;
+		}
+		return false;
+	}
+
 	isSqlAlchemySessionReceiver(receiver: PythonSyntaxNode): boolean {
 		if (this.invalid || receiver.type !== "identifier") return false;
 		let current: PythonSyntaxNode | null | undefined = receiver.parent;
@@ -738,28 +760,79 @@ function callArguments(call: PythonSyntaxNode): PythonSyntaxNode[] {
 	);
 }
 
+// Node types that ARE SQL text, or that compose it (`+`, `%`).
+const COMPOSED_SQL_NODE_TYPES = new Set([
+	"string",
+	"concatenated_string",
+	"binary_operator",
+]);
+
+/**
+ * True when an expression carries SQL text a caller composed — a literal, a
+ * concatenation, a `%` format, an f-string, `"...".format(...)`, or any call
+ * that wraps one. Fails closed at the depth cap: unknown means composed.
+ */
+function carriesComposedSql(
+	node: PythonSyntaxNode | undefined,
+	depth = 0,
+): boolean {
+	if (!node) return false;
+	if (depth > EXPRESSION_DEPTH_CAP) return true;
+	if (COMPOSED_SQL_NODE_TYPES.has(node.type)) return true;
+	if (node.type !== "call") return false;
+	const callee = calleeNode(node);
+	if (callee?.type === "attribute") {
+		// `"SELECT {}".format(uid)` — the template hangs off the callee.
+		const object =
+			callee.childForFieldName?.("object") ?? namedChildren(callee)[0];
+		if (carriesComposedSql(object, depth + 1)) return true;
+	}
+	return callArguments(node).some((argument) =>
+		carriesComposedSql(argument, depth + 1),
+	);
+}
+
+/**
+ * The builder name a call invokes: a bare `select(...)`, or `sa.select(...)`
+ * where `sa` is a PROVEN sqlalchemy import. Without that proof any object's
+ * `.update(...)` would read as a statement builder (#2577 review F2).
+ */
+function builderCalleeName(
+	call: PythonSyntaxNode,
+	summary: PythonProvenanceSummary,
+): string | undefined {
+	const callee = calleeNode(call);
+	if (callee?.type === "identifier") return callee.text;
+	if (callee?.type !== "attribute") return undefined;
+	const object =
+		callee.childForFieldName?.("object") ?? namedChildren(callee)[0];
+	if (expressionProvenance(object, summary) !== "sqlalchemy-module") {
+		return undefined;
+	}
+	const attribute =
+		callee.childForFieldName?.("attribute") ?? namedChildren(callee).at(-1);
+	return attribute?.type === "identifier" ? attribute.text : undefined;
+}
+
 /**
  * `select(User)`, `sa.update(User)`, `text("SELECT 1")` — a statement object,
  * not a SQL string. `text()` is the one builder that carries raw SQL, so only a
- * literal template counts: `text("..." + uid)` stays diagnostic.
+ * literal template counts; and no builder may wrap composed SQL, or
+ * `update("UPDATE t SET x=" + uid)` would launder it (#2577 review F2).
  */
-function isStatementBuilderCall(node: PythonSyntaxNode | undefined): boolean {
+function isStatementBuilderCall(
+	node: PythonSyntaxNode | undefined,
+	summary: PythonProvenanceSummary,
+): boolean {
 	if (node?.type !== "call") return false;
-	const callee = calleeNode(node);
-	const name =
-		callee?.type === "identifier"
-			? callee.text
-			: callee?.type === "attribute"
-				? (
-						callee.childForFieldName?.("attribute") ??
-						namedChildren(callee).at(-1)
-					)?.text
-				: undefined;
+	const name = builderCalleeName(node, summary);
 	if (!name) return false;
-	if (PYTHON_SQLALCHEMY_STATEMENT_BUILDERS.has(name)) return true;
-	if (name !== "text") return false;
 	const args = callArguments(node);
-	return args.length === 1 && isStaticStringLiteral(args[0]);
+	if (name === "text") {
+		return args.length === 1 && isStaticStringLiteral(args[0]);
+	}
+	if (!PYTHON_SQLALCHEMY_STATEMENT_BUILDERS.has(name)) return false;
+	return !args.some((argument) => carriesComposedSql(argument));
 }
 
 /**
@@ -771,11 +844,38 @@ export function isSqlAlchemyStatementArgument(
 	root: PythonSyntaxNode | undefined,
 ): boolean {
 	if (!node || !root) return false;
-	if (isStatementBuilderCall(node)) return true;
+	const summary = getPythonProvenanceSummary(root);
+	if (isStatementBuilderCall(node, summary)) return true;
 	if (node.type !== "identifier") return false;
-	const bound = getPythonProvenanceSummary(root).singleAssignmentValue(
-		node.text,
-		node,
-	);
-	return isStatementBuilderCall(bound ?? undefined);
+	const bound = summary.singleAssignmentValue(node.text, node);
+	return isStatementBuilderCall(bound ?? undefined, summary);
+}
+
+/**
+ * `Session.query` takes mapped classes, so it must NOT require a builder
+ * argument (`db.query(User)` is the case #2576 reports). It suppresses only
+ * what cannot be SQL text: composed strings and opaque function-local values
+ * stay diagnostic (#2577 review F1).
+ */
+export function isSqlAlchemyEntityQueryArgument(
+	node: PythonSyntaxNode | undefined,
+	root: PythonSyntaxNode | undefined,
+): boolean {
+	if (!node || !root) return false;
+	const summary = getPythonProvenanceSummary(root);
+	const isEntity = (
+		candidate: PythonSyntaxNode | undefined,
+		depth: number,
+	): boolean => {
+		if (!candidate || depth > EXPRESSION_DEPTH_CAP) return false;
+		if (isStatementBuilderCall(candidate, summary)) return true;
+		if (carriesComposedSql(candidate)) return false;
+		if (candidate.type !== "identifier") return true;
+		const bound = summary.singleAssignmentValue(candidate.text, node);
+		if (bound) return isEntity(bound, depth + 1);
+		// A name the enclosing function binds is a runtime value; a free or
+		// module-level name is the mapped class this API expects.
+		return !summary.isFunctionLocalName(candidate);
+	};
+	return isEntity(node, 0);
 }

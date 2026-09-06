@@ -93,6 +93,28 @@ describe("tree-sitter security gap rules", () => {
 		expect(matches.length).toBe(0);
 	});
 
+	it("does not match SQLAlchemy session.execute(stmt)", async () => {
+		const client = getSharedTreeSitterClient()!;
+		const query = await getQuery("python-sql-injection");
+		const filePath = writeTempFile(
+			"py",
+			`from sqlalchemy import select\nstmt = select(MyModel).where(MyModel.id == 42)\nresult = await session.execute(stmt)\n`,
+		);
+		const matches = await client.runQueryOnFile(query, filePath, "python");
+		expect(matches.length).toBe(0);
+	});
+
+	it("does not match SQLAlchemy expression-builder execute calls", async () => {
+		const client = getSharedTreeSitterClient()!;
+		const query = await getQuery("python-sql-injection");
+		const filePath = writeTempFile(
+			"py",
+			`result = conn.execute(select(MyModel).where(MyModel.id == user_id))\n`,
+		);
+		const matches = await client.runQueryOnFile(query, filePath, "python");
+		expect(matches.length).toBe(0);
+	});
+
 	it("does not match a structurally proven SQLAlchemy Session query", async () => {
 		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("python-sql-injection");

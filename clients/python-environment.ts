@@ -31,6 +31,15 @@ interface UvWorkspace {
 	explicit: boolean;
 	/** The nearest ancestor (inclusive) holding a `pyproject.toml`. */
 	projectRoot: string;
+	/**
+	 * True when {@link projectRoot} IS the directory the walk started from —
+	 * i.e. the caller's root is itself a uv project, not merely a directory
+	 * somewhere beneath one. This is the whole gate for "does this directory
+	 * get uv's project settings": the walk answers "which project OWNS this
+	 * directory", which is a different question and only decides membership
+	 * (review round 3, S1).
+	 */
+	isStartDir: boolean;
 	members: string[];
 	exclude: string[];
 }
@@ -54,6 +63,7 @@ async function findUvWorkspace(
 	startDir: string,
 	homeDir: string,
 ): Promise<UvWorkspace | undefined> {
+	const resolvedStart = path.resolve(startDir);
 	let nearestProject: string | undefined;
 	for (const dir of walkUpDirs(startDir)) {
 		if (isAtOrAboveHomeDir(dir, homeDir)) break;
@@ -75,6 +85,7 @@ async function findUvWorkspace(
 				root: dir,
 				explicit: true,
 				projectRoot: nearestProject,
+				isStartDir: nearestProject === resolvedStart,
 				members: parseTomlStringArray(workspaceTable, "members"),
 				exclude: parseTomlStringArray(workspaceTable, "exclude"),
 			};
@@ -86,6 +97,7 @@ async function findUvWorkspace(
 				root: nearestProject,
 				explicit: false,
 				projectRoot: nearestProject,
+				isStartDir: nearestProject === resolvedStart,
 				members: [],
 				exclude: [],
 			}
@@ -121,8 +133,15 @@ function isUvWorkspaceMember(
 	workspace: UvWorkspace,
 	projectRoot: string,
 ): boolean {
-	if (projectRoot === workspace.root) return true;
-
+	// No `projectRoot === workspace.root` shortcut. uv treats the workspace
+	// root as a member of its own workspace, but only in its capacity as a
+	// PROJECT — and a project already gets uv's settings through `isStartDir`,
+	// with its own `<root>/.venv` reached by the ordinary project candidate at
+	// the very same path. Answering "member" on directory equality made every
+	// non-project subdirectory of the workspace root inherit the workspace
+	// `.venv`, `exclude` included, because equality was tested before the
+	// walk result was consulted (review round 3, S2). The relative-path guard
+	// below returns false for the root itself, which is the intended answer.
 	const relative = toPosix(path.relative(workspace.root, projectRoot));
 	if (
 		relative.length === 0 ||
@@ -146,24 +165,30 @@ export async function detectPythonEnvironment(
 	projectRoot: string,
 	homeDir: string = os.homedir(),
 ): Promise<PythonEnvironment | undefined> {
+	// `path.resolve` once at the seam entry so `isStartDir` below compares like
+	// with like: `walkUpDirs` resolves its input, a caller's argument need not
+	// be normalized.
 	const root = path.resolve(projectRoot);
 	const uvWorkspace = await findUvWorkspace(root, homeDir);
-	// Only a DECLARED, non-excluded member of an explicit workspace inherits
-	// that workspace's `.venv` and resolves `UV_PROJECT_ENVIRONMENT` against
-	// the workspace root; every other project is its own single-project
-	// workspace rooted at its own `pyproject.toml`.
+	// `UV_PROJECT_ENVIRONMENT` and the workspace `.venv` are uv PROJECT
+	// settings. uv applies them to a directory only when that directory IS the
+	// project — a `pyproject.toml` merely sitting somewhere ABOVE it makes it a
+	// subdirectory of a project, not a project, and nothing below a project
+	// root inherits from it (the F3 decision, applied consistently). Exporting
+	// `UV_PROJECT_ENVIRONMENT` process-wide is uv's own documented CI/Docker
+	// recipe, so a gate on "a pyproject exists at or above root" lets one
+	// image-level variable capture every subdirectory on the box that happens
+	// to sit under some Python project.
+	const isProjectRoot = uvWorkspace?.isStartDir === true;
+	// A declared, non-excluded member of an EXPLICIT workspace is itself a
+	// project root, so this is a strict refinement of `isProjectRoot`: it adds
+	// the workspace `.venv` candidate and re-anchors a relative
+	// `UV_PROJECT_ENVIRONMENT` at the workspace root.
 	const memberWorkspaceRoot =
-		uvWorkspace?.explicit === true &&
-		isUvWorkspaceMember(uvWorkspace, uvWorkspace.projectRoot)
+		isProjectRoot && uvWorkspace.explicit && isUvWorkspaceMember(uvWorkspace, root)
 			? uvWorkspace.root
 			: undefined;
-	// `UV_PROJECT_ENVIRONMENT` is a uv PROJECT setting: uv reads it only after
-	// discovering a `pyproject.toml`, and resolves a relative value against
-	// that project's workspace root — never against the cwd, and never for a
-	// directory with no project above it. Exporting it process-wide is uv's
-	// own documented CI/Docker recipe, so an unconditional candidate would let
-	// one image-level variable hijack every unrelated checkout on the box.
-	const uvEnvironmentRoot = uvWorkspace
+	const uvEnvironmentRoot = isProjectRoot
 		? (memberWorkspaceRoot ?? uvWorkspace.projectRoot)
 		: undefined;
 	const uvProjectEnvironment = process.env.UV_PROJECT_ENVIRONMENT;

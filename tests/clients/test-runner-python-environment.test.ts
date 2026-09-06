@@ -33,7 +33,10 @@ vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 	safeSpawnAsync,
 }));
 
-import { detectPythonEnvironment } from "../../clients/python-environment.js";
+import {
+	detectPythonEnvironment,
+	type PythonEnvironmentSource,
+} from "../../clients/python-environment.js";
 import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
 
 const tempDirs: string[] = [];
@@ -118,30 +121,33 @@ async function runPytest(
 	return { command, options };
 }
 
+// File-level so BOTH describes below get the isolation: the state-space grid
+// sets these same variables, and hooks scoped to one describe left the other
+// reading a leaked VIRTUAL_ENV (AGENTS.md test screen: env leakage).
+beforeEach(() => {
+	originalVirtualEnv = process.env.VIRTUAL_ENV;
+	originalCondaPrefix = process.env.CONDA_PREFIX;
+	originalUvProjectEnvironment = process.env.UV_PROJECT_ENVIRONMENT;
+	delete process.env.VIRTUAL_ENV;
+	delete process.env.CONDA_PREFIX;
+	delete process.env.UV_PROJECT_ENVIRONMENT;
+	safeSpawnAsync.mockClear();
+	findGlobalBinary.mockClear();
+});
+
+afterEach(() => {
+	restoreEnvironmentVariable("VIRTUAL_ENV", originalVirtualEnv);
+	restoreEnvironmentVariable("CONDA_PREFIX", originalCondaPrefix);
+	restoreEnvironmentVariable(
+		"UV_PROJECT_ENVIRONMENT",
+		originalUvProjectEnvironment,
+	);
+	for (const dir of tempDirs.splice(0)) {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 describe("pytest project environment", () => {
-	beforeEach(() => {
-		originalVirtualEnv = process.env.VIRTUAL_ENV;
-		originalCondaPrefix = process.env.CONDA_PREFIX;
-		originalUvProjectEnvironment = process.env.UV_PROJECT_ENVIRONMENT;
-		delete process.env.VIRTUAL_ENV;
-		delete process.env.CONDA_PREFIX;
-		delete process.env.UV_PROJECT_ENVIRONMENT;
-		safeSpawnAsync.mockClear();
-		findGlobalBinary.mockClear();
-	});
-
-	afterEach(() => {
-		restoreEnvironmentVariable("VIRTUAL_ENV", originalVirtualEnv);
-		restoreEnvironmentVariable("CONDA_PREFIX", originalCondaPrefix);
-		restoreEnvironmentVariable(
-			"UV_PROJECT_ENVIRONMENT",
-			originalUvProjectEnvironment,
-		);
-		for (const dir of tempDirs.splice(0)) {
-			fs.rmSync(dir, { recursive: true, force: true });
-		}
-	});
-
 	it("runs pytest with an unactivated project .venv", async () => {
 		const { root, testFile, pythonPath, binDir } = createProject(true);
 		const inheritedPath = process.env.PATH;
@@ -237,20 +243,19 @@ describe("pytest project environment", () => {
 	});
 
 	// uv resolves a relative UV_PROJECT_ENVIRONMENT against the workspace root
-	// of the project it discovered, never against the directory it was handed
-	// (uv 3c979abda4530fe9bf3d92e9bcf5c5575e3b3126,
-	// crates/uv-workspace/src/workspace.rs). pi-lens hands this resolver a
-	// dispatch cwd / LSP root, which can sit BELOW the pyproject.toml that
-	// defines the project (review round 2, F2).
-	it("resolves a relative UV_PROJECT_ENVIRONMENT from the discovered project root", async () => {
+	// of the project it discovered (uv 3c979abda4530fe9bf3d92e9bcf5c5575e3b3126,
+	// crates/uv-workspace/src/workspace.rs), never against the cwd. Round 2 of
+	// this PR pinned that with a fixture whose passed root sat BELOW the
+	// pyproject.toml — the rejected premise: a directory below a project root
+	// gets nothing (I1/I2). Here the passed root IS the project.
+	it("resolves a relative UV_PROJECT_ENVIRONMENT from the project root itself", async () => {
 		const workspace = createProject(false);
 		fs.writeFileSync(
 			path.join(workspace.root, "pyproject.toml"),
 			"[tool.uv.workspace]\nmembers = ['packages/*']\n",
 		);
-		// Not a member of the workspace above it, so it is its own single-
-		// project workspace: `.uv-env` resolves against ITS root, not against
-		// the `tests/` subdirectory pi-lens happens to hand the resolver.
+		// Not a member of the workspace above it, so it is its own single-project
+		// workspace and `.uv-env` resolves against ITS OWN root.
 		const standalone = path.join(workspace.root, "tools", "standalone");
 		const testFile = createTestFile(standalone);
 		fs.writeFileSync(
@@ -260,13 +265,171 @@ describe("pytest project environment", () => {
 		const expected = createEnvironment(path.join(standalone, ".uv-env"));
 		process.env.UV_PROJECT_ENVIRONMENT = ".uv-env";
 
-		const { command, options } = await runPytest(
-			testFile,
-			path.dirname(testFile),
-		);
+		const { command, options } = await runPytest(testFile, standalone);
 
 		expect(command).toBe(expected.pythonPath);
 		expect(options.env?.VIRTUAL_ENV).toBe(expected.root);
+	});
+
+	// The sibling of the case above, and the S1 defect: pi-lens hands this
+	// resolver a dispatch cwd / LSP root that can sit BELOW the pyproject.toml
+	// (PythonServer's NearestRoot detector returns `<mono>/frontend` off a
+	// requirements.txt while the pyproject.toml sits at `<mono>`). Such a
+	// directory is not the project, so it inherits nothing from it — not the
+	// project's UV_PROJECT_ENVIRONMENT, not an ancestor `.venv`. Guard for:
+	// the uv candidates gated on "a pyproject at or ABOVE root" rather than
+	// "root IS the project" (review round 3, S1).
+	it("gives a directory below a project root none of that project's uv environment", async () => {
+		const workspace = createProject(false);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[project]\nname='app'\n",
+		);
+		createEnvironment(path.join(workspace.root, ".uv-env"));
+		const below = path.join(workspace.root, "frontend");
+		const testFile = createTestFile(below);
+		const own = createEnvironment(path.join(below, ".venv"));
+		process.env.UV_PROJECT_ENVIRONMENT = ".uv-env";
+
+		const { command, options } = await runPytest(testFile, below);
+
+		expect(command).toBe(own.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(own.root);
+	});
+
+	// Probe R2: the same shape with an activated VIRTUAL_ENV, which must win
+	// over a project the directory does not belong to (review round 3, S1).
+	it("keeps an activated VIRTUAL_ENV for a directory below a project root", async () => {
+		const workspace = createProject(false);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[tool.poetry]\nname='mono'\n",
+		);
+		const exported = createEnvironment(createTempDir("pi-lens-uv-ci-env-"));
+		const activated = createEnvironment(
+			createTempDir("pi-lens-activated-env-"),
+		);
+		const below = path.join(workspace.root, "frontend");
+		const testFile = createTestFile(below);
+		process.env.UV_PROJECT_ENVIRONMENT = exported.root;
+		process.env.VIRTUAL_ENV = activated.root;
+
+		const { command, options } = await runPytest(testFile, below);
+
+		expect(command).toBe(activated.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(activated.root);
+	});
+
+	// uv treats the workspace root as a member of its own workspace, but only
+	// as a PROJECT: `<ws>/docs` is not a project and must not inherit the
+	// workspace `.venv` just because `path.relative(ws, ws)` was compared
+	// before the walk result was consulted. Guard for: the
+	// `projectRoot === workspace.root` shortcut in `isUvWorkspaceMember`
+	// promoting any non-project subdirectory of the workspace root to a member
+	// — bypassing `exclude` entirely (review round 3, S2).
+	it("does not give a non-project subdirectory of a workspace root the workspace .venv", async () => {
+		const workspace = createProject(false);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[tool.uv.workspace]\nmembers = ['packages/*']\n",
+		);
+		createEnvironment(path.join(workspace.root, ".venv"));
+		const docs = path.join(workspace.root, "docs");
+		const testFile = createTestFile(docs);
+
+		const { command, options } = await runPytest(testFile, docs);
+
+		expect(command).toBe("python");
+		expect(options.env).toBeUndefined();
+	});
+
+	it("does not give an EXCLUDED non-project subdirectory the workspace .venv", async () => {
+		const workspace = createProject(false);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[tool.uv.workspace]\nmembers = ['packages/*']\nexclude = ['docs']\n",
+		);
+		createEnvironment(path.join(workspace.root, ".venv"));
+		const docs = path.join(workspace.root, "docs");
+		const testFile = createTestFile(docs);
+
+		const { command, options } = await runPytest(testFile, docs);
+
+		expect(command).toBe("python");
+		expect(options.env).toBeUndefined();
+	});
+
+	// Probe G: the workspace root IS a project, so it keeps its own `.venv` —
+	// the same directory the deleted shortcut used to report as `uv-workspace`.
+	it("keeps the workspace root itself on its own .venv", async () => {
+		const workspace = createProject(false);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[tool.uv.workspace]\nmembers = ['packages/*']\n",
+		);
+		const own = createEnvironment(path.join(workspace.root, ".venv"));
+
+		const environment = await detectPythonEnvironment(
+			workspace.root,
+			os.tmpdir(),
+		);
+
+		expect(environment?.source).toBe("project-dot-venv");
+		expect(environment?.root).toBe(own.root);
+	});
+
+	// uv matches member globs with `require_literal_leading_dot: false`
+	// (MatchOptions::new()'s default, uv 3c979abda4530fe9bf3d92e9bcf5c5575e3b3126
+	// `is_included_in_workspace`), so `*` matches a dot-directory. minimatch
+	// needs `dot: true` to say the same thing. Guard for: dropping that option
+	// (review round 3, T2).
+	it("matches a dot-directory member the way uv's MatchOptions do", async () => {
+		const workspace = createProject(false);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[tool.uv.workspace]\nmembers = ['*']\n",
+		);
+		const expected = createEnvironment(path.join(workspace.root, ".venv"));
+		const member = path.join(workspace.root, ".hidden-pkg");
+		fs.mkdirSync(member, { recursive: true });
+		fs.writeFileSync(
+			path.join(member, "pyproject.toml"),
+			"[project]\nname='hidden'\n",
+		);
+
+		const environment = await detectPythonEnvironment(member, os.tmpdir());
+
+		expect(environment?.source).toBe("uv-workspace");
+		expect(environment?.root).toBe(expected.root);
+	});
+
+	// `detectPythonEnvironment` resolves its root once at the seam entry, so
+	// every path it hands back is absolute and every path comparison it makes
+	// is against an absolute path. `path.join`/`path.relative` normalize an
+	// unnormalized ABSOLUTE argument on their own, so only a relative argument
+	// exercises this: without it, the probe still finds `proj/.venv` (relative
+	// `access` resolves against the cwd) and hands the caller a relative
+	// interpreter path to spawn. Guard for: dropping that normalization
+	// (review round 3, T2). `process.chdir` is a deliberate boundary here —
+	// a relative root is only meaningful against a cwd — and is restored in
+	// `finally`.
+	it("resolves a relative root to an absolute interpreter path", async () => {
+		const workspace = createProject(true);
+		const expected = path.join(workspace.root, ".venv");
+		const originalCwd = process.cwd();
+
+		try {
+			process.chdir(path.dirname(workspace.root));
+			const environment = await detectPythonEnvironment(
+				path.basename(workspace.root),
+				os.tmpdir(),
+			);
+
+			expect(environment?.source).toBe("project-dot-venv");
+			expect(environment?.root).toBe(expected);
+		} finally {
+			process.chdir(originalCwd);
+		}
 	});
 
 	// The resolver walks up for a pyproject.toml, so an ancestor project's
@@ -291,23 +454,29 @@ describe("pytest project environment", () => {
 		expect(options.env).toBeUndefined();
 	});
 
-	// `walkUpDirs` is unbounded, so without the HOME ceiling a pyproject.toml
-	// sitting in `/tmp` (or any ancestor above the user's home) supplies the
-	// environment for every project below it. `isAtOrAboveHomeDir` is the
-	// shared ceiling primitive (#625), and `homeDir` is injected the way every
-	// sibling walker takes it (#2536/#2544 F2). Guard for: the walk reading a
-	// pyproject.toml at or above $HOME (review round 2, F6).
-	it("stops the uv project walk at the home directory", async () => {
+	// `walkUpDirs` is unbounded, so without the HOME ceiling an unrelated
+	// `[tool.uv.workspace]` sitting in `/tmp`, `/home`, or `$HOME` itself claims
+	// every project beneath it as a member and lends them its `.venv`.
+	// `isAtOrAboveHomeDir` is the shared ceiling primitive (#625), and `homeDir`
+	// is injected the way every sibling walker takes it (#2536/#2544 F2).
+	// Guard for: the walk reading a pyproject.toml at or above $HOME (review
+	// round 2, F6). The fixture claims the project as a MEMBER because the
+	// round-3 `isStartDir` gate already discards a bare ancestor project — only
+	// an explicit workspace above $HOME can still change the answer.
+	it("stops the uv workspace walk at the home directory", async () => {
 		const base = createTempDir("pi-lens-uv-home-ceiling-");
 		const homeDir = path.join(base, "home");
 		const project = path.join(homeDir, "project");
 		fs.mkdirSync(project, { recursive: true });
 		fs.writeFileSync(
-			path.join(base, "pyproject.toml"),
-			"[project]\nname='above-home'\n",
+			path.join(project, "pyproject.toml"),
+			"[project]\nname='mine'\n",
 		);
-		createEnvironment(path.join(base, ".uv-env"));
-		process.env.UV_PROJECT_ENVIRONMENT = ".uv-env";
+		fs.writeFileSync(
+			path.join(base, "pyproject.toml"),
+			"[tool.uv.workspace]\nmembers = ['home/*']\n",
+		);
+		createEnvironment(path.join(base, ".venv"));
 
 		expect(await detectPythonEnvironment(project, homeDir)).toBeUndefined();
 	});
@@ -445,4 +614,198 @@ describe("pytest project environment", () => {
 		expect(usageError.error).toBe("Pytest configuration error");
 		expect(interrupted.error).toBe("Pytest interrupted");
 	});
+});
+
+/**
+ * The resolver's full state space (review round 3). AGENTS.md's state-space
+ * step applies once a seam reaches this round count: the grid below is
+ * derived from the DOCUMENTED contract, not read off the implementation —
+ *
+ *   I1 the two uv candidates exist only when the passed root IS a uv project
+ *      root; the `uv-workspace` candidate additionally requires root to be a
+ *      declared, non-excluded member of an explicit workspace.
+ *   I2 nothing below a project root inherits anything from above it.
+ *   I3 a relative UV_PROJECT_ENVIRONMENT anchors at the member's workspace
+ *      root, else at the project root (which, per I1, is the passed root).
+ *   I4 precedence: uv-project-environment > uv-workspace > VIRTUAL_ENV >
+ *      CONDA_PREFIX > <root>/.venv > <root>/venv; a candidate whose
+ *      interpreter is missing falls through, and exhausting them is
+ *      `undefined`.
+ *
+ * The expected source per cell is computed from those four rules alone
+ * (`expectedSource` below), so a change in the implementation that is not
+ * also a change in the contract reds here rather than silently re-baselining
+ * — the "implementation mirror" screen. Each uv-project-environment cell also
+ * asserts the resolved ROOT, which is what pins I3's anchor: the fixture
+ * materializes the environment only at the contract's anchor, so a resolver
+ * anchoring anywhere else falls through to a different source.
+ *
+ * CONDA_PREFIX is held unset (an unconditional pass-through already pinned by
+ * tests/clients/lsp/server-policy.test.ts) and <root>/venv held absent; both
+ * sit below `.venv` in I4 and add no interaction.
+ */
+describe("python environment state space (review round 3)", () => {
+	type Position = "A1" | "A2" | "A3" | "A4" | "A5" | "A6";
+	const POSITIONS: Array<[Position, string]> = [
+		["A1", "root-is-project (implicit single project)"],
+		["A2", "root-below-project"],
+		["A3", "root-is-declared-member of an explicit workspace"],
+		["A4", "root-excluded (a project the workspace excludes)"],
+		["A5", "no-pyproject anywhere at or above root"],
+		["A6", "root-is-explicit-workspace-root"],
+	];
+	const UV_VALUES = ["U-abs", "U-rel", "U-unset"] as const;
+	const VIRTUAL_VALUES = ["V-set", "V-unset"] as const;
+	const DOT_VENV_VALUES = ["D-present", "D-absent"] as const;
+
+	/** I1: does the passed root get uv's project settings at all? */
+	const isProjectRoot = (position: Position): boolean =>
+		position === "A1" ||
+		position === "A3" ||
+		position === "A4" ||
+		position === "A6";
+	/** I1: does it additionally inherit the workspace `.venv`? */
+	const isWorkspaceMember = (position: Position): boolean => position === "A3";
+
+	function expectedSource(
+		position: Position,
+		uv: (typeof UV_VALUES)[number],
+		virtualEnv: (typeof VIRTUAL_VALUES)[number],
+		dotVenv: (typeof DOT_VENV_VALUES)[number],
+	): PythonEnvironmentSource | undefined {
+		if (isProjectRoot(position) && uv !== "U-unset")
+			return "uv-project-environment";
+		if (isWorkspaceMember(position)) return "uv-workspace";
+		if (virtualEnv === "V-set") return "virtual-env";
+		if (dotVenv === "D-present") return "project-dot-venv";
+		return undefined;
+	}
+
+	interface Cell {
+		root: string;
+		workspaceRoot: string | undefined;
+		/** Where I3 says a relative UV_PROJECT_ENVIRONMENT resolves, if at all. */
+		uvAnchor: string | undefined;
+		/**
+		 * Where a resolver that violated I1/I2 would anchor instead. Populated
+		 * for A2 so the U-rel cells are discriminating: without a decoy at the
+		 * ancestor project root, "no environment there" masks "should not have
+		 * looked there" (review round 3, S1).
+		 */
+		decoyAnchor?: string;
+	}
+
+	/**
+	 * Materialize one cell on disk. The workspace `.venv` exists for every
+	 * explicit-workspace shape (A3/A4) so that "did the resolver offer the
+	 * uv-workspace candidate" is observable rather than masked by a missing
+	 * directory; for A6 the workspace root's `.venv` IS `<root>/.venv` and so
+	 * follows the D axis.
+	 */
+	function buildCell(base: string, position: Position): Cell {
+		const write = (file: string, body: string): void => {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, body);
+		};
+		const workspaceToml = (exclude: boolean): string =>
+			`[tool.uv.workspace]\nmembers = ['packages/*']\n${
+				exclude ? "exclude = ['packages/member']\n" : ""
+			}`;
+		switch (position) {
+			case "A1": {
+				const root = path.join(base, "proj");
+				write(path.join(root, "pyproject.toml"), "[project]\nname='p'\n");
+				return { root, workspaceRoot: undefined, uvAnchor: root };
+			}
+			case "A2": {
+				const project = path.join(base, "proj");
+				write(path.join(project, "pyproject.toml"), "[project]\nname='p'\n");
+				createEnvironment(path.join(project, ".venv"));
+				const root = path.join(project, "frontend");
+				fs.mkdirSync(root, { recursive: true });
+				return {
+					root,
+					workspaceRoot: undefined,
+					uvAnchor: undefined,
+					decoyAnchor: project,
+				};
+			}
+			case "A3":
+			case "A4": {
+				const workspaceRoot = path.join(base, "ws");
+				write(
+					path.join(workspaceRoot, "pyproject.toml"),
+					workspaceToml(position === "A4"),
+				);
+				createEnvironment(path.join(workspaceRoot, ".venv"));
+				const root = path.join(workspaceRoot, "packages", "member");
+				write(path.join(root, "pyproject.toml"), "[project]\nname='m'\n");
+				return {
+					root,
+					workspaceRoot,
+					uvAnchor: position === "A3" ? workspaceRoot : root,
+				};
+			}
+			case "A5": {
+				const root = path.join(base, "plain");
+				fs.mkdirSync(root, { recursive: true });
+				return { root, workspaceRoot: undefined, uvAnchor: undefined };
+			}
+			case "A6": {
+				const root = path.join(base, "ws");
+				write(path.join(root, "pyproject.toml"), workspaceToml(false));
+				return { root, workspaceRoot: root, uvAnchor: root };
+			}
+		}
+	}
+
+	for (const [position, label] of POSITIONS)
+		for (const uv of UV_VALUES)
+			for (const virtualEnv of VIRTUAL_VALUES)
+				for (const dotVenv of DOT_VENV_VALUES) {
+					const cell = `${position} ${uv} ${virtualEnv} ${dotVenv}`;
+					const expected = expectedSource(position, uv, virtualEnv, dotVenv);
+					it(`${cell} -> ${expected ?? "undefined"} (${label})`, async () => {
+						const base = createTempDir("pi-lens-uv-cell-");
+						const { root, uvAnchor, decoyAnchor } = buildCell(base, position);
+						if (dotVenv === "D-present")
+							createEnvironment(path.join(root, ".venv"));
+
+						let uvRoot: string | undefined;
+						if (uv === "U-abs") {
+							uvRoot = createEnvironment(
+								path.join(base, "absolute-uv-env"),
+							).root;
+							process.env.UV_PROJECT_ENVIRONMENT = uvRoot;
+						} else if (uv === "U-rel") {
+							// Materialized ONLY at the contract's anchor (I3).
+							uvRoot = uvAnchor
+								? createEnvironment(path.join(uvAnchor, ".uv-env")).root
+								: undefined;
+							if (decoyAnchor)
+								createEnvironment(path.join(decoyAnchor, ".uv-env"));
+							process.env.UV_PROJECT_ENVIRONMENT = ".uv-env";
+						}
+						let activated: string | undefined;
+						if (virtualEnv === "V-set") {
+							activated = createEnvironment(
+								path.join(base, "activated"),
+							).root;
+							process.env.VIRTUAL_ENV = activated;
+						}
+
+						const environment = await detectPythonEnvironment(
+							root,
+							os.tmpdir(),
+						);
+
+						expect(environment?.source).toBe(expected);
+						if (expected === "uv-project-environment")
+							expect(environment?.root).toBe(uvRoot);
+						if (expected === "virtual-env")
+							expect(environment?.root).toBe(activated);
+						if (expected === "project-dot-venv")
+							expect(environment?.root).toBe(path.join(root, ".venv"));
+					});
+				}
 });

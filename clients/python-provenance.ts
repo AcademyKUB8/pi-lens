@@ -863,19 +863,14 @@ export function isSqlAlchemyEntityQueryArgument(
 ): boolean {
 	if (!node || !root) return false;
 	const summary = getPythonProvenanceSummary(root);
-	const isEntity = (
-		candidate: PythonSyntaxNode | undefined,
-		depth: number,
-	): boolean => {
-		if (!candidate || depth > EXPRESSION_DEPTH_CAP) return false;
-		if (isStatementBuilderCall(candidate, summary)) return true;
-		if (carriesComposedSql(candidate)) return false;
-		if (candidate.type !== "identifier") return true;
-		const bound = summary.singleAssignmentValue(candidate.text, node);
-		if (bound) return isEntity(bound, depth + 1);
-		// A name the enclosing function binds is a runtime value; a free or
-		// module-level name is the mapped class this API expects.
-		return !summary.isFunctionLocalName(candidate);
-	};
-	return isEntity(node, 0);
+	if (isStatementBuilderCall(node, summary)) return true;
+	if (carriesComposedSql(node)) return false;
+	if (node.type !== "identifier") return true;
+	// A name the enclosing function binds is a runtime value that may hold SQL
+	// text (`q = build_sql(uid); db.query(q)`), so it stays diagnostic whatever
+	// it was assigned; a free or module-level name is the mapped class this API
+	// expects. A model built inside the function (`User = get_model()`) is
+	// statically indistinguishable from the first and fires: accepted noise,
+	// since following the assignment loses the true positive (#2577 round 3).
+	return !summary.isFunctionLocalName(node);
 }

@@ -622,6 +622,24 @@ from models import User
     return db.query("SELECT * FROM t WHERE id=%s" % uid)
 `,
 			),
+			"x2 q = build_sql(uid); db.query(q)": env.addFile(
+				"q-x2-bound-to-call.py",
+				`${header}def find(db: Session, uid):
+    q = build_sql(uid)
+    return db.query(q)
+`,
+			),
+			// Accepted noise: a model built at runtime is indistinguishable from
+			// x2 statically, and losing x2 is the worse trade (#2577 round 3 N-2).
+			"n1 User = get_model(); db.query(User) — accepted noise": env.addFile(
+				"q-n1-dynamic-model.py",
+				`from sqlalchemy.orm import Session
+
+def find(db: Session):
+    User = get_model()
+    return db.query(User)
+`,
+			),
 			"c06 db.query(opaque_parameter)": env.addFile(
 				"q-c06-opaque.py",
 				`${header}def find(db: Session, q):
@@ -663,7 +681,22 @@ from models import User
 		// F2: an attribute callee counts as a statement builder only when its
 		// object is a proven sqlalchemy import, and no builder call launders a
 		// composed SQL string.
+		// Nine wrappers put the concatenation one level past
+		// EXPRESSION_DEPTH_CAP, where carriesComposedSql must fail CLOSED.
+		const deepWrap = (inner: string, depth: number) =>
+			`${Array.from({ length: depth }, (_, index) => `f${index + 1}(`).join(
+				"",
+			)}${inner}${")".repeat(depth)}`;
 		const fires = {
+			"d1 composed SQL nested past EXPRESSION_DEPTH_CAP": env.addFile(
+				"b-d1-deep-composed.py",
+				`import sqlalchemy as sa
+from sqlalchemy.orm import Session
+
+def find(db: Session, uid):
+    return db.execute(sa.select(${deepWrap('"SELECT * FROM t WHERE id=" + uid', 9)}))
+`,
+			),
 			"w1 db.execute(repo.update('...' + uid))": env.addFile(
 				"b-w1-repo-update.py",
 				`from sqlalchemy.orm import Session

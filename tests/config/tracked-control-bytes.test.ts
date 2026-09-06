@@ -130,25 +130,84 @@ describe("tracked source files contain no literal control bytes (#2571)", () => 
 		}
 	});
 
-	it("bounds records and reports the dropped count without losing identity", () => {
+	it("reports 0x01, 0x1B, and 0x1F control bytes with the correct code point and escaped remediation", () => {
+		const fixtureRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-control-byte-nonnul-"),
+		);
+		try {
+			const cases: ReadonlyArray<{
+				file: string;
+				byte: number;
+				codePoint: string;
+				escaped: string;
+			}> = [
+				{ file: "soh.ts", byte: 0x01, codePoint: "U+0001", escaped: "\\u0001" },
+				{ file: "esc.ts", byte: 0x1b, codePoint: "U+001B", escaped: "\\u001b" },
+				{ file: "us.ts", byte: 0x1f, codePoint: "U+001F", escaped: "\\u001f" },
+			];
+			for (const { file, byte, codePoint, escaped } of cases) {
+				fs.writeFileSync(
+					path.join(fixtureRoot, file),
+					Buffer.from([0x61, byte, 0x62]),
+				);
+				const result = scanTrackedSourceFiles([file], fixtureRoot);
+				expect(result.violations).toEqual([{ file, offset: 1, byte }]);
+				const hex = byte.toString(16).padStart(2, "0").toUpperCase();
+				expect(formatControlByteScan(result)).toContain(
+					`${file}: byte 0x${hex} (${codePoint}) at offset 1; use escaped spelling such as ${escaped}.`,
+				);
+			}
+		} finally {
+			fs.rmSync(fixtureRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds records across files and reports the dropped count without losing per-file identity", () => {
 		const fixtureRoot = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-control-byte-dense-"),
 		);
 		try {
-			const file = "dense.md";
-			fs.writeFileSync(path.join(fixtureRoot, file), Buffer.alloc(128, 0x00));
-			const result = scanTrackedSourceFiles([file], fixtureRoot);
-			expect(result.violations.length).toBeGreaterThan(0);
-			expect(result.violations.length).toBeLessThanOrEqual(100);
+			const fileA = "dense-a.md";
+			const fileB = "dense-b.md";
+			// 60 + 60 = 120 violations across two files against a 100-record cap:
+			// the first 60 come from fileA, the cap is reached 40 bytes into
+			// fileB, and fileB's remaining 20 bytes are dropped. This pins that
+			// the shared cap is enforced across files, not reset per file, and
+			// that dropped findings from a later file are still visible (by
+			// name in the report, and by count) rather than silently absorbed
+			// into the earlier file's tally.
+			fs.writeFileSync(path.join(fixtureRoot, fileA), Buffer.alloc(60, 0x00));
+			fs.writeFileSync(path.join(fixtureRoot, fileB), Buffer.alloc(60, 0x00));
+			const result = scanTrackedSourceFiles([fileA, fileB], fixtureRoot);
+			expect(result.violations.length).toBe(100);
 			expect(
-				result.violations.every(
-					(violation) => violation.file === file && violation.byte === 0x00,
-				),
-			).toBe(true);
-			expect(result.dropped).toBe(128 - result.violations.length);
-			expect(formatControlByteScan(result)).toContain(
-				`... ${result.dropped} additional control-byte findings omitted after the report limit.`,
+				result.violations.filter((violation) => violation.file === fileA)
+					.length,
+			).toBe(60);
+			expect(
+				result.violations.filter((violation) => violation.file === fileB)
+					.length,
+			).toBe(40);
+			expect(result.dropped).toBe(20);
+			const report = formatControlByteScan(result);
+			expect(report).toContain(fileB);
+			expect(report).toContain(
+				"... 20 additional control-byte findings omitted after the report limit.",
 			);
+		} finally {
+			fs.rmSync(fixtureRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("does not treat printable space (0x20) as a control byte", () => {
+		const fixtureRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-control-byte-space-"),
+		);
+		try {
+			const file = "space.ts";
+			fs.writeFileSync(path.join(fixtureRoot, file), Buffer.from([0x20]));
+			const result = scanTrackedSourceFiles([file], fixtureRoot);
+			expect(result).toEqual({ violations: [], dropped: 0 });
 		} finally {
 			fs.rmSync(fixtureRoot, { recursive: true, force: true });
 		}

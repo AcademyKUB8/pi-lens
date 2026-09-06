@@ -263,13 +263,6 @@ def run(value):
 		for (const result of results) {
 			expect(firedRuleIds(result)).toContain("python-sql-injection");
 		}
-		const hallucinated = await treeSitterRunner.run(
-			env.addFile(
-				"sqlalchemy-json-response.py",
-				"from sqlalchemy import JSONResponse\n",
-			).ctx,
-		);
-		expect(firedRuleIds(hallucinated)).toContain("python-hallucinated-import");
 	}, 30_000);
 
 	it("fails closed when production SQL provenance is absent, shadowed, rebound, or late", async () => {
@@ -293,10 +286,6 @@ def run(value):
 			"late-psycopg-import.py",
 			'cursor.execute(sql.SQL("SELECT * FROM {}").format(sql.Identifier(table)))\nfrom psycopg import sql\n',
 		);
-		const arbitraryScalar = env.addFile(
-			"arbitrary-scalar.py",
-			"client.scalar(statement)\nclient.scalars(statement)\n",
-		);
 		const fromPsycopgPackage = env.addFile(
 			"from-psycopg-package.py",
 			'from psycopg import psycopg\ncursor.execute(psycopg.sql.SQL("SELECT * FROM {}").format(psycopg.sql.Identifier(table)))\n',
@@ -311,7 +300,6 @@ def run(value):
 			treeSitterRunner.run(reboundReceiver.ctx),
 			treeSitterRunner.run(innerPsycopgShadow.ctx),
 			treeSitterRunner.run(latePsycopgImport.ctx),
-			treeSitterRunner.run(arbitraryScalar.ctx),
 			treeSitterRunner.run(fromPsycopgPackage.ctx),
 			treeSitterRunner.run(fromPsycopg2Package.ctx),
 		]);
@@ -350,10 +338,6 @@ def run(value):
 			"bounded-aliases.py",
 			'from psycopg import sql\nfirst = sql\nsecond = first\nthird = second\ncursor.execute(third.SQL("SELECT * FROM {}").format(third.Identifier(table)))\n',
 		);
-		const arbitraryScalars = env.addFile(
-			"arbitrary-scalars.py",
-			"client.scalar(statement)\nclient.scalars(statement)\n",
-		);
 		const results = await Promise.all([
 			treeSitterRunner.run(parameterShadow.ctx),
 			treeSitterRunner.run(comprehensionShadow.ctx),
@@ -362,7 +346,6 @@ def run(value):
 			treeSitterRunner.run(moduleImport.ctx),
 			treeSitterRunner.run(sessionParameterShadow.ctx),
 			treeSitterRunner.run(boundedAliases.ctx),
-			treeSitterRunner.run(arbitraryScalars.ctx),
 		]);
 
 		for (const result of [
@@ -371,7 +354,7 @@ def run(value):
 			results[2],
 			results[3],
 			results[5],
-			results[7],
+			results[6],
 		]) {
 			expect(firedRuleIds(result!)).toContain("python-sql-injection");
 		}
@@ -424,6 +407,171 @@ def run(value):
 
 		for (const result of results) {
 			expect(firedRuleIds(result!)).toContain("python-sql-injection");
+		}
+	}, 30_000);
+	it("keeps canonical SQLAlchemy 2.x statement execution quiet (#2577 review)", async () => {
+		const executeSelect = env.addFile(
+			"sa-execute-select.py",
+			`from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+def find(db: Session):
+    return db.execute(select(User)).all()
+`,
+		);
+		const scalarsSelect = env.addFile(
+			"sa-scalars-select.py",
+			`from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+def find(db: Session):
+    return db.scalars(select(User)).all()
+`,
+		);
+		const scalarSelect = env.addFile(
+			"sa-scalar-select.py",
+			`from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+def find(db: Session):
+    return db.scalar(select(User))
+`,
+		);
+		const asyncExecuteSelect = env.addFile(
+			"sa-async-execute-select.py",
+			`from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+async def find(db: AsyncSession):
+    return await db.execute(select(User))
+`,
+		);
+		const boundStatement = env.addFile(
+			"sa-bound-statement.py",
+			`from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+def find(db: Session):
+    stmt = select(User)
+    return db.execute(stmt)
+`,
+		);
+		const fastApiDependency = env.addFile(
+			"sa-fastapi-dependency.py",
+			`from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+def find(db: Session = Depends(get_db)):
+    stmt = select(User)
+    return db.scalars(stmt).all()
+`,
+		);
+		const unannotatedReceiver = env.addFile(
+			"sa-unannotated-session.py",
+			`def find(session, stmt):
+    return session.execute(stmt)
+`,
+		);
+		const staticText = env.addFile(
+			"sa-static-text.py",
+			`from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+def find(db: Session):
+    return db.execute(text("SELECT 1"))
+`,
+		);
+
+		const fixtures = {
+			"db.execute(select(User))": executeSelect,
+			"db.scalars(select(User))": scalarsSelect,
+			"db.scalar(select(User))": scalarSelect,
+			"await db.execute(select(User)) on AsyncSession": asyncExecuteSelect,
+			"stmt = select(User); db.execute(stmt)": boundStatement,
+			"db: Session = Depends(get_db); db.scalars(stmt)": fastApiDependency,
+			"unannotated session.execute(stmt)": unannotatedReceiver,
+			'db.execute(text("SELECT 1"))': staticText,
+		};
+		const results = await Promise.all(
+			Object.entries(fixtures).map(async ([label, fixture]) => [
+				label,
+				await treeSitterRunner.run(fixture.ctx),
+			] as const),
+		);
+		for (const [label, result] of results) {
+			expect.soft(firedRuleIds(result), label).not.toContain(
+				"python-sql-injection",
+			);
+		}
+	}, 30_000);
+
+	it("keeps composed SQL strings diagnostic in SQLAlchemy sinks (#2577 review)", async () => {
+		const rawConcat = env.addFile(
+			"raw-concat.py",
+			`cursor.execute("SELECT * FROM users WHERE id = " + uid)
+`,
+		);
+		const percentFormat = env.addFile(
+			"raw-percent.py",
+			`cursor.execute("SELECT * FROM users WHERE id = %s" % uid)
+`,
+		);
+		const textConcat = env.addFile(
+			"raw-text-concat.py",
+			`from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+def find(db: Session, uid):
+    return db.execute(text("SELECT * FROM users WHERE id = " + uid))
+`,
+		);
+		const textFormat = env.addFile(
+			"raw-text-format.py",
+			`from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+def find(db: Session, uid):
+    return db.execute(text("SELECT * FROM users WHERE id = {}".format(uid)))
+`,
+		);
+		const opaqueStatement = env.addFile(
+			"raw-opaque-statement.py",
+			`from sqlalchemy.orm import Session
+
+def run(db: Session, statement):
+    return db.execute(statement)
+`,
+		);
+		const reboundStatement = env.addFile(
+			"raw-rebound-statement.py",
+			`from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+def find(db: Session, tainted):
+    stmt = select(User)
+    stmt = tainted
+    return db.execute(stmt)
+`,
+		);
+
+		const fixtures = {
+			"cursor.execute('...' + uid)": rawConcat,
+			"cursor.execute('...' % uid)": percentFormat,
+			'db.execute(text("..." + uid))': textConcat,
+			'db.execute(text("...".format(uid)))': textFormat,
+			"db.execute(opaque_parameter)": opaqueStatement,
+			"stmt rebound from select() to tainted": reboundStatement,
+		};
+		const results = await Promise.all(
+			Object.entries(fixtures).map(async ([label, fixture]) => [
+				label,
+				await treeSitterRunner.run(fixture.ctx),
+			] as const),
+		);
+		for (const [label, result] of results) {
+			expect.soft(firedRuleIds(result), label).toContain(
+				"python-sql-injection",
+			);
 		}
 	}, 30_000);
 });

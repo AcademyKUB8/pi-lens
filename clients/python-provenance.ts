@@ -34,14 +34,6 @@ interface ParsedImportBinding {
 	local: string;
 }
 
-interface ParsedImportStatement {
-	kind: "from" | "plain" | "unknown";
-	moduleName: string | undefined;
-	bindings: ParsedImportBinding[];
-	unknown: boolean;
-	star: boolean;
-}
-
 interface FunctionSummary {
 	parameterAnnotations: ReadonlyMap<string, string>;
 	bindingCounts: ReadonlyMap<string, number>;
@@ -54,6 +46,11 @@ export interface PythonProvenanceSummary {
 		reference: PythonSyntaxNode,
 	): PythonProvenance | null;
 	isSqlAlchemySessionReceiver(receiver: PythonSyntaxNode): boolean;
+	/** The value assigned to `name`, iff `name` is bound exactly once. */
+	singleAssignmentValue(
+		name: string,
+		reference: PythonSyntaxNode,
+	): PythonSyntaxNode | null;
 }
 
 const SUMMARY_BY_ROOT = new WeakMap<
@@ -63,10 +60,34 @@ const SUMMARY_BY_ROOT = new WeakMap<
 const TRAVERSAL_VISIT_CAP = 50_000;
 const TRAVERSAL_DEPTH_CAP = 128;
 const EXPRESSION_DEPTH_CAP = 8;
+const BINDING_SCAN_DEPTH_CAP = 32;
 const ANCESTOR_DEPTH_CAP = 64;
+
+/**
+ * Receiver names conventionally bound to a SQLAlchemy session. The pre-existing
+ * `session.execute(...)` exemption keys off these; structural provenance below
+ * proves the annotated case.
+ */
+export const PYTHON_SQLALCHEMY_RECEIVER_NAMES: ReadonlySet<string> = new Set([
+	"session",
+	"db_session",
+	"async_session",
+	"sync_session",
+]);
+/** Statement constructors whose result is an expression object, never a string. */
+export const PYTHON_SQLALCHEMY_STATEMENT_BUILDERS: ReadonlySet<string> = new Set(
+	["select", "insert", "update", "delete"],
+);
+/** Session/AsyncSession methods that execute a statement object. */
+export const PYTHON_SQLALCHEMY_STATEMENT_METHODS: ReadonlySet<string> = new Set([
+	"execute",
+	"scalar",
+	"scalars",
+]);
 
 const FROM_IMPORT_PROVENANCE = new Map<string, PythonProvenance>([
 	["sqlalchemy.orm:Session", "sqlalchemy-session"],
+	["sqlalchemy.ext.asyncio:AsyncSession", "sqlalchemy-session"],
 	["psycopg:sql", "psycopg-sql-module"],
 	["psycopg2:sql", "psycopg-sql-module"],
 	["psycopg.sql:SQL", "psycopg-sql-constructor"],
@@ -87,6 +108,11 @@ function namedChildren(node: PythonSyntaxNode): PythonSyntaxNode[] {
 	return (node.children ?? []).filter((child) => child.isNamed);
 }
 
+function calleeNode(call: PythonSyntaxNode): PythonSyntaxNode | undefined {
+	if (call.type !== "call") return undefined;
+	return call.childForFieldName?.("function") ?? namedChildren(call)[0];
+}
+
 function directNamedChild(
 	node: PythonSyntaxNode,
 	type: string,
@@ -94,19 +120,21 @@ function directNamedChild(
 	return namedChildren(node).find((child) => child.type === type);
 }
 
-type BindingNameClassifier = (node: PythonSyntaxNode) => BindingNameDecision;
+/**
+ * Where a name may be introduced. `target` is an assignment/for/walrus target,
+ * `pattern` a `match` case pattern, `as` a `with`/`except` clause whose binder
+ * is its `as_pattern_target`. Anything unrecognized sets `unknown`, which
+ * invalidates the whole summary — this analysis fails closed.
+ */
+type BindingScanMode = "target" | "pattern" | "as";
 
-type BindingNameDecision =
-	| { kind: "record" }
-	| { kind: "stop" }
-	| { kind: "unknown" }
-	| { kind: "descend"; children: PythonSyntaxNode[] }
-	| {
-			kind: "delegate";
-			node: PythonSyntaxNode | undefined;
-			classifier: BindingNameClassifier;
-	  };
+interface BindingScan {
+	names: string[];
+	unknown: boolean;
+}
 
+// Containers hold further binding positions; reference types (`a.b`, `a[b]`,
+// `Mod.Case`) never introduce a name.
 const BINDING_TARGET_CONTAINER_TYPES = new Set([
 	"tuple",
 	"pattern_list",
@@ -133,243 +161,105 @@ const BINDING_PATTERN_REFERENCE_TYPES = new Set([
 	"qualified_pattern",
 ]);
 
-function applyBindingNameDecision(
-	current: { node: PythonSyntaxNode; classifier: BindingNameClassifier },
-	decision: BindingNameDecision,
-	names: string[],
-	stack: Array<{ node: PythonSyntaxNode; classifier: BindingNameClassifier }>,
-): boolean {
-	switch (decision.kind) {
-		case "record":
-			if (current.node.text !== "_") names.push(current.node.text);
-			return false;
-		case "stop":
-			return false;
-		case "unknown":
-			return true;
-		case "descend":
-			for (const child of decision.children) {
-				stack.push({ node: child, classifier: current.classifier });
+function scanBindingNames(
+	node: PythonSyntaxNode | undefined,
+	mode: BindingScanMode,
+	scan: BindingScan,
+	depth = 0,
+): void {
+	if (!node || depth > BINDING_SCAN_DEPTH_CAP) {
+		scan.unknown = true;
+		return;
+	}
+	const descend = (child: PythonSyntaxNode | undefined, next: BindingScanMode) =>
+		scanBindingNames(child, next, scan, depth + 1);
+	if (node.type === "as_pattern_target") {
+		descend(namedChildren(node)[0], "target");
+		return;
+	}
+	if (mode === "as") {
+		// `with ctx() as name` / `except E as name`: only the as-target binds.
+		for (const child of namedChildren(node)) descend(child, "as");
+		return;
+	}
+	if (node.type === "identifier") {
+		if (node.text !== "_") scan.names.push(node.text);
+		return;
+	}
+	if (mode === "pattern") {
+		if (node.type === "dotted_name") {
+			// A bare `case name` captures; `case Mod.CONST` is a value reference.
+			if (!node.text.includes(".") && node.text !== "_") {
+				scan.names.push(node.text);
 			}
-			return false;
-		case "delegate":
-			if (!decision.node) return true;
-			stack.push({
-				node: decision.node,
-				classifier: decision.classifier,
-			});
-			return false;
-	}
-}
-
-function collectBindingNames(
-	root: PythonSyntaxNode | undefined,
-	classifier: BindingNameClassifier,
-): { names: string[]; unknown: boolean } {
-	if (!root) return { names: [], unknown: true };
-	const names: string[] = [];
-	const stack: Array<{
-		node: PythonSyntaxNode;
-		classifier: BindingNameClassifier;
-	}> = [{ node: root, classifier }];
-	let unknown = false;
-	while (stack.length > 0) {
-		const current = stack.pop();
-		if (!current) continue;
-		const decision = current.classifier(current.node);
-		if (applyBindingNameDecision(current, decision, names, stack)) {
-			unknown = true;
+			return;
 		}
+		if (BINDING_PATTERN_REFERENCE_TYPES.has(node.type)) return;
+		if (node.type === "keyword_pattern") {
+			// `Wrapper(field=capture)`: the keyword itself is not a binder.
+			const value = namedChildren(node).slice(1);
+			if (value.length !== 1) scan.unknown = true;
+			else descend(value[0], "pattern");
+			return;
+		}
+		if (BINDING_PATTERN_CONTAINER_TYPES.has(node.type)) {
+			for (const child of namedChildren(node)) descend(child, "pattern");
+			return;
+		}
+		scan.unknown = true;
+		return;
 	}
-	return { names, unknown };
-}
-
-function classifyBindingTarget(node: PythonSyntaxNode): BindingNameDecision {
-	if (node.type === "identifier") return { kind: "record" };
-	// These contain references, never binding positions.
-	if (BINDING_TARGET_REFERENCE_TYPES.has(node.type)) return { kind: "stop" };
+	if (BINDING_TARGET_REFERENCE_TYPES.has(node.type)) return;
 	if (BINDING_TARGET_CONTAINER_TYPES.has(node.type)) {
-		return { kind: "descend", children: namedChildren(node) };
+		for (const child of namedChildren(node)) descend(child, "target");
+		return;
 	}
-	return { kind: "unknown" };
-}
-
-function classifyAsPatternTarget(node: PythonSyntaxNode): BindingNameDecision {
-	if (node.type === "as_pattern_target") {
-		return {
-			kind: "delegate",
-			node: namedChildren(node)[0],
-			classifier: classifyBindingTarget,
-		};
-	}
-	return { kind: "descend", children: namedChildren(node) };
-}
-
-function classifyBindingPattern(node: PythonSyntaxNode): BindingNameDecision {
-	if (node.type === "identifier") return { kind: "record" };
-	if (node.type === "dotted_name") {
-		return node.text.includes(".") ? { kind: "stop" } : { kind: "record" };
-	}
-	if (BINDING_PATTERN_REFERENCE_TYPES.has(node.type)) return { kind: "stop" };
-	if (node.type === "keyword_pattern") {
-		// The first named child is the keyword field; only its value pattern
-		// may introduce captures (`Wrapper(field=capture)`).
-		const value = namedChildren(node).slice(1);
-		return value.length === 1
-			? {
-					kind: "delegate",
-					node: value[0],
-					classifier: classifyBindingPattern,
-				}
-			: { kind: "unknown" };
-	}
-	if (BINDING_PATTERN_CONTAINER_TYPES.has(node.type)) {
-		return { kind: "descend", children: namedChildren(node) };
-	}
-	if (node.type === "as_pattern_target") {
-		return {
-			kind: "delegate",
-			node,
-			classifier: classifyBindingTarget,
-		};
-	}
-	return { kind: "unknown" };
+	scan.unknown = true;
 }
 
 /** Extract only identifiers in Python binding positions. */
-function bindingTargetNames(node: PythonSyntaxNode | undefined): {
-	names: string[];
-	unknown: boolean;
-} {
-	return collectBindingNames(node, classifyBindingTarget);
+function collectBindingNames(
+	node: PythonSyntaxNode | undefined,
+	mode: BindingScanMode,
+): BindingScan {
+	const scan: BindingScan = { names: [], unknown: false };
+	scanBindingNames(node, mode, scan);
+	return scan;
 }
 
-function asPatternTargetNames(node: PythonSyntaxNode): {
-	names: string[];
-	unknown: boolean;
-} {
-	return collectBindingNames(node, classifyAsPatternTarget);
-}
-
-function bindingPatternNames(node: PythonSyntaxNode | undefined): {
-	names: string[];
-	unknown: boolean;
-} {
-	return collectBindingNames(node, classifyBindingPattern);
-}
-
-function parseAliasedImport(
+/**
+ * One import clause. `source` is the name as written in the module
+ * (`sql` in `from psycopg import sql`, `psycopg.sql` in `import psycopg.sql`);
+ * `local` is the name it binds.
+ */
+function parseImportBinding(
 	node: PythonSyntaxNode,
+	isFrom: boolean,
 ): ParsedImportBinding | undefined {
-	const children = namedChildren(node);
-	const source = children[0]?.text;
-	const local = children.at(-1);
-	if (!source || local?.type !== "identifier") return undefined;
-	return { source, local: local.text };
-}
-
-function parseFromBinding(
-	node: PythonSyntaxNode,
-): ParsedImportBinding | undefined {
-	if (node.type === "aliased_import") return parseAliasedImport(node);
+	if (node.type === "aliased_import") {
+		const children = namedChildren(node);
+		const source = children[0]?.text;
+		const local = children.at(-1);
+		return source && local?.type === "identifier"
+			? { source, local: local.text }
+			: undefined;
+	}
 	if (node.type !== "dotted_name" && node.type !== "identifier") {
 		return undefined;
 	}
-	return { source: node.text, local: node.text };
-}
-
-function parsePlainBinding(
-	node: PythonSyntaxNode,
-): ParsedImportBinding | undefined {
-	if (node.type === "aliased_import") return parseAliasedImport(node);
-	if (node.type !== "dotted_name" && node.type !== "identifier") {
-		return undefined;
-	}
-	const [local] = node.text.split(".");
+	if (isFrom) return { source: node.text, local: node.text };
+	const local = node.text.split(".")[0];
 	return local ? { source: node.text, local } : undefined;
 }
 
-function parseFromImport(node: PythonSyntaxNode): ParsedImportStatement {
-	const children = namedChildren(node);
-	const moduleName = children[0]?.text;
-	const bindings: ParsedImportBinding[] = [];
-	let unknown = !moduleName;
-	for (const part of children.slice(1)) {
-		const binding = parseFromBinding(part);
-		if (binding) bindings.push(binding);
-		else unknown = true;
-	}
-	return {
-		kind: "from",
-		moduleName,
-		bindings,
-		unknown,
-		star: node.text.includes("*"),
-	};
-}
-
-function parsePlainImport(node: PythonSyntaxNode): ParsedImportStatement {
-	const bindings: ParsedImportBinding[] = [];
-	let unknown = false;
-	for (const part of namedChildren(node)) {
-		const binding = parsePlainBinding(part);
-		if (binding) bindings.push(binding);
-		else unknown = true;
-	}
-	return {
-		kind: "plain",
-		moduleName: undefined,
-		bindings,
-		unknown,
-		star: node.text.includes("*"),
-	};
-}
-
-function parseImportStatement(node: PythonSyntaxNode): ParsedImportStatement {
-	if (node.type === "import_from_statement") return parseFromImport(node);
-	if (node.type === "import_statement") return parsePlainImport(node);
-	return {
-		kind: "unknown",
-		moduleName: undefined,
-		bindings: [],
-		unknown: true,
-		star: node.text.includes("*"),
-	};
-}
-
-function importedNames(statement: ParsedImportStatement): {
-	names: string[];
-	unknown: boolean;
-	star: boolean;
-} {
-	return {
-		names: statement.bindings.map((binding) => binding.local),
-		unknown: statement.unknown,
-		star: statement.star,
-	};
-}
-
-function eligibleImports(
-	statement: ParsedImportStatement,
-	endIndex: number,
-): EligibleImport[] {
-	if (statement.kind === "plain") {
-		return statement.bindings.flatMap((binding) => {
-			const provenance = PLAIN_PACKAGE_PROVENANCE.get(binding.source);
-			return provenance ? [{ name: binding.local, provenance, endIndex }] : [];
-		});
-	}
-	if (statement.kind !== "from" || !statement.moduleName) return [];
-	return statement.bindings.flatMap((binding) => {
-		const provenance = FROM_IMPORT_PROVENANCE.get(
-			`${statement.moduleName}:${binding.source}`,
-		);
-		return provenance ? [{ name: binding.local, provenance, endIndex }] : [];
-	});
-}
-
 function directAnnotationName(parameter: PythonSyntaxNode): string | undefined {
-	if (parameter.type !== "typed_parameter") return undefined;
+	// `typed_default_parameter` is FastAPI's `db: Session = Depends(get_db)`.
+	if (
+		parameter.type !== "typed_parameter" &&
+		parameter.type !== "typed_default_parameter"
+	) {
+		return undefined;
+	}
 	const type = directNamedChild(parameter, "type");
 	const children = type ? namedChildren(type) : [];
 	return children.length === 1 && children[0]?.type === "identifier"
@@ -385,6 +275,7 @@ function parameterName(parameter: PythonSyntaxNode): string | undefined {
 interface SummaryBuildState {
 	imports: Map<string, EligibleImport>;
 	bindingCounts: Map<string, number>;
+	assignments: Map<string, PythonSyntaxNode>;
 	functionBindings: Map<string, Map<string, number>>;
 	functionAnnotations: Map<string, Map<string, string>>;
 	invalid: boolean;
@@ -423,7 +314,7 @@ function addTarget(
 	target: PythonSyntaxNode | undefined,
 	functionChain: PythonSyntaxNode[],
 ): void {
-	const extracted = bindingTargetNames(target);
+	const extracted = collectBindingNames(target, "target");
 	if (extracted.unknown) markInvalid(state);
 	for (const name of extracted.names) addBinding(state, name, functionChain);
 }
@@ -471,14 +362,31 @@ function recordImportBindings(
 	node: PythonSyntaxNode,
 	state: SummaryBuildState,
 ): void {
-	const statement = parseImportStatement(node);
-	const imported = importedNames(statement);
-	if (imported.unknown || imported.star) markInvalid(state);
-	for (const name of imported.names)
-		addBinding(state, name, state.functionChain);
-	if (!state.moduleDirect) return;
-	for (const candidate of eligibleImports(statement, node.endIndex)) {
-		state.imports.set(candidate.name, candidate);
+	const isFrom = node.type === "import_from_statement";
+	const children = namedChildren(node);
+	const moduleName = isFrom ? children[0]?.text : undefined;
+	// A star import can introduce anything: give up on the file.
+	if (node.text.includes("*") || (isFrom && !moduleName)) markInvalid(state);
+	for (const part of isFrom ? children.slice(1) : children) {
+		const binding = parseImportBinding(part, isFrom);
+		if (!binding) {
+			markInvalid(state);
+			continue;
+		}
+		addBinding(state, binding.local, state.functionChain);
+		// Only imports at module top level prove provenance: a class-body or
+		// function-body import is not in scope for the sink's namespace.
+		if (!state.moduleDirect) continue;
+		const provenance = isFrom
+			? FROM_IMPORT_PROVENANCE.get(`${moduleName}:${binding.source}`)
+			: PLAIN_PACKAGE_PROVENANCE.get(binding.source);
+		if (provenance) {
+			state.imports.set(binding.local, {
+				name: binding.local,
+				provenance,
+				endIndex: node.endIndex,
+			});
+		}
 	}
 }
 
@@ -493,11 +401,27 @@ function recordTargetBinding(
 	);
 }
 
+/**
+ * `stmt = select(User)` — the assigned value, indexed by name. Only consulted
+ * when the name has exactly one binding in the file, so a rebound or shadowed
+ * name never proves anything.
+ */
+function recordAssignmentValue(
+	node: PythonSyntaxNode,
+	state: SummaryBuildState,
+): void {
+	recordTargetBinding(node, state);
+	const target = node.childForFieldName?.("left") ?? namedChildren(node)[0];
+	const value = node.childForFieldName?.("right") ?? namedChildren(node).at(-1);
+	if (target?.type !== "identifier" || !value || value === target) return;
+	state.assignments.set(target.text, value);
+}
+
 function recordAsPatternBinding(
 	node: PythonSyntaxNode,
 	state: SummaryBuildState,
 ): void {
-	const extracted = asPatternTargetNames(node);
+	const extracted = collectBindingNames(node, "as");
 	if (extracted.unknown) markInvalid(state);
 	for (const name of extracted.names)
 		addBinding(state, name, state.functionChain);
@@ -516,10 +440,26 @@ function recordCaseBindings(
 	node: PythonSyntaxNode,
 	state: SummaryBuildState,
 ): void {
-	const extracted = bindingPatternNames(directNamedChild(node, "case_pattern"));
+	const extracted = collectBindingNames(
+		directNamedChild(node, "case_pattern"),
+		"pattern",
+	);
 	if (extracted.unknown) markInvalid(state);
 	for (const name of extracted.names)
 		addBinding(state, name, state.functionChain);
+}
+
+/**
+ * `global sql` / `nonlocal sql` — the declaration alone is enough to give up on
+ * the name (covered by the "global" case of the fail-closed runner regression).
+ */
+function recordDeclarationBindings(
+	node: PythonSyntaxNode,
+	state: SummaryBuildState,
+): void {
+	for (const child of namedChildren(node)) {
+		addBinding(state, child.text, state.functionChain);
+	}
 }
 
 function recordDefinitionBinding(
@@ -542,40 +482,23 @@ function recordTypeAliasBinding(
 	else markInvalid(state);
 }
 
-function recordDeclarationBindings(
-	node: PythonSyntaxNode,
-	state: SummaryBuildState,
-): void {
-	for (const child of namedChildren(node)) {
-		addBinding(state, child.text, state.functionChain);
-	}
-}
+const DYNAMIC_NAMESPACE_BUILTINS = new Set([
+	"exec",
+	"eval",
+	"globals",
+	"locals",
+	"vars",
+]);
 
-function recordTypeParameterBindings(
-	node: PythonSyntaxNode,
-	state: SummaryBuildState,
-): void {
-	for (const child of namedChildren(node)) {
-		if (child.type === "identifier") {
-			addBinding(state, child.text, state.functionChain);
-		}
-	}
-}
-
-function hasDynamicNamespaceHazard(node: PythonSyntaxNode): boolean {
-	if (node.type !== "call") return false;
-	const callee = node.childForFieldName?.("function") ?? namedChildren(node)[0];
-	return (
-		callee?.type === "identifier" &&
-		["exec", "eval", "globals", "locals", "vars"].includes(callee.text)
-	);
-}
-
+/** `exec`/`eval`/`globals()` can rebind anything: give up on the whole file. */
 function recordDynamicNamespaceHazard(
 	node: PythonSyntaxNode,
 	state: SummaryBuildState,
 ): void {
-	if (hasDynamicNamespaceHazard(node)) markInvalid(state);
+	const callee = calleeNode(node);
+	if (callee?.type === "identifier" && DYNAMIC_NAMESPACE_BUILTINS.has(callee.text)) {
+		markInvalid(state);
+	}
 }
 
 const SUMMARY_NODE_RECORDERS: Readonly<Record<string, SummaryNodeRecorder>> =
@@ -585,7 +508,7 @@ const SUMMARY_NODE_RECORDERS: Readonly<Record<string, SummaryNodeRecorder>> =
 		lambda: recordLambdaParameters,
 		import_from_statement: recordImportBindings,
 		import_statement: recordImportBindings,
-		assignment: recordTargetBinding,
+		assignment: recordAssignmentValue,
 		augmented_assignment: recordTargetBinding,
 		named_expression: recordTargetBinding,
 		for_statement: recordTargetBinding,
@@ -598,21 +521,21 @@ const SUMMARY_NODE_RECORDERS: Readonly<Record<string, SummaryNodeRecorder>> =
 		type_alias_statement: recordTypeAliasBinding,
 		global_statement: recordDeclarationBindings,
 		nonlocal_statement: recordDeclarationBindings,
-		type_parameter: recordTypeParameterBindings,
-		type_parameter_list: recordTypeParameterBindings,
 		call: recordDynamicNamespaceHazard,
 	});
 
 class Summary implements PythonProvenanceSummary {
 	readonly invalid: boolean;
 	private readonly imports: ReadonlyMap<string, EligibleImport>;
-	private readonly tainted: ReadonlySet<string>;
+	private readonly bindingCounts: ReadonlyMap<string, number>;
+	private readonly assignments: ReadonlyMap<string, PythonSyntaxNode>;
 	private readonly functions: ReadonlyMap<string, FunctionSummary>;
 
 	constructor(root: PythonSyntaxNode) {
 		const state: SummaryBuildState = {
 			imports: new Map(),
 			bindingCounts: new Map(),
+			assignments: new Map(),
 			functionBindings: new Map(),
 			functionAnnotations: new Map(),
 			invalid: false,
@@ -650,16 +573,10 @@ class Summary implements PythonProvenanceSummary {
 		};
 		visit(root, 0, false, []);
 
-		const tainted = new Set<string>();
-		for (const [name, count] of state.bindingCounts) {
-			if (count !== 1 || !state.imports.has(name)) tainted.add(name);
-		}
-		for (const name of state.imports.keys()) {
-			if ((state.bindingCounts.get(name) ?? 0) !== 1) tainted.add(name);
-		}
 		this.invalid = state.invalid;
 		this.imports = state.imports;
-		this.tainted = tainted;
+		this.bindingCounts = state.bindingCounts;
+		this.assignments = state.assignments;
 		this.functions = new Map(
 			[...state.functionAnnotations.entries()].map(([key, annotations]) => [
 				key,
@@ -675,11 +592,25 @@ class Summary implements PythonProvenanceSummary {
 		name: string,
 		reference: PythonSyntaxNode,
 	): PythonProvenance | null {
-		if (this.invalid || this.tainted.has(name)) return null;
-		const candidate = this.imports.get(name);
+		// Exactly one binding in the file, and it is the import itself: any
+		// shadow, rebind or `del` anywhere makes the name unusable as proof.
+		const candidate = this.boundOnce(name) ? this.imports.get(name) : undefined;
 		return candidate && candidate.endIndex <= reference.startIndex
 			? candidate.provenance
 			: null;
+	}
+
+	private boundOnce(name: string): boolean {
+		return !this.invalid && (this.bindingCounts.get(name) ?? 0) === 1;
+	}
+
+	singleAssignmentValue(
+		name: string,
+		reference: PythonSyntaxNode,
+	): PythonSyntaxNode | null {
+		if (!this.boundOnce(name)) return null;
+		const value = this.assignments.get(name);
+		return value && value.endIndex <= reference.startIndex ? value : null;
 	}
 
 	isSqlAlchemySessionReceiver(receiver: PythonSyntaxNode): boolean {
@@ -794,4 +725,57 @@ export function isProvenSqlAlchemySessionReceiver(
 		!!root &&
 		getPythonProvenanceSummary(root).isSqlAlchemySessionReceiver(receiver)
 	);
+}
+
+function isStaticStringLiteral(node: PythonSyntaxNode | undefined): boolean {
+	return (
+		node?.type === "string" &&
+		!namedChildren(node).some((child) => child.type === "interpolation")
+	);
+}
+
+function callArguments(call: PythonSyntaxNode): PythonSyntaxNode[] {
+	return namedChildren(directNamedChild(call, "argument_list") ?? call).filter(
+		(child) => child.type !== "comment",
+	);
+}
+
+/**
+ * `select(User)`, `sa.update(User)`, `text("SELECT 1")` — a statement object,
+ * not a SQL string. `text()` is the one builder that carries raw SQL, so only a
+ * literal template counts: `text("..." + uid)` stays diagnostic.
+ */
+function isStatementBuilderCall(node: PythonSyntaxNode | undefined): boolean {
+	if (node?.type !== "call") return false;
+	const callee = calleeNode(node);
+	const name =
+		callee?.type === "identifier"
+			? callee.text
+			: callee?.type === "attribute"
+				? (callee.childForFieldName?.("attribute") ??
+					namedChildren(callee).at(-1))?.text
+				: undefined;
+	if (!name) return false;
+	if (PYTHON_SQLALCHEMY_STATEMENT_BUILDERS.has(name)) return true;
+	if (name !== "text") return false;
+	const args = callArguments(node);
+	return args.length === 1 && isStaticStringLiteral(args[0]);
+}
+
+/**
+ * True when a statement-executing argument is a builder call, or a name bound
+ * exactly once in the file to one (`stmt = select(User); db.execute(stmt)`).
+ */
+export function isSqlAlchemyStatementArgument(
+	node: PythonSyntaxNode | undefined,
+	root: PythonSyntaxNode | undefined,
+): boolean {
+	if (!node || !root) return false;
+	if (isStatementBuilderCall(node)) return true;
+	if (node.type !== "identifier") return false;
+	const bound = getPythonProvenanceSummary(root).singleAssignmentValue(
+		node.text,
+		node,
+	);
+	return isStatementBuilderCall(bound ?? undefined);
 }

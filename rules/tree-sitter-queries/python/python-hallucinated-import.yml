@@ -30,7 +30,10 @@ metavars:
   - MODULE
   - NAME
 
-post_filter: py_hallucinated_import
+post_filter: match_captures
+post_filter_params:
+  MODULE: "^(requests|flask|django|typing|collections|asyncio|json|unittest|pytest|urllib)$"
+  NAME: "^(JSONResponse|HTMLResponse|RedirectResponse|StreamingResponse|Depends|Query|Path|Body|Header|Cookie|Form|File|UploadFile|FastAPI|APIRouter|HTTPException|BackgroundTasks|dataclass|fields|BaseModel|Field|validator|aiohttp|parse|stringify|fixture|TestCase|get|post|put|delete|Model|Session|Column|Integer|String)$"
 
 has_fix: false
 

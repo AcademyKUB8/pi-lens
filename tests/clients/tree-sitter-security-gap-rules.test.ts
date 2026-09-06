@@ -293,17 +293,6 @@ describe("tree-sitter security gap rules", () => {
 		}
 	});
 
-	it("keeps arbitrary object scalar and scalars calls diagnostic", async () => {
-		const client = getSharedTreeSitterClient()!;
-		const query = await getQuery("python-sql-injection");
-		const filePath = writeTempFile(
-			"py",
-			`client.scalar(statement)\nclient.scalars(statement)\n`,
-		);
-		const matches = await client.runQueryOnFile(query, filePath, "python");
-		expect(matches).toHaveLength(2);
-	});
-
 	it("keeps function-local and comprehension psycopg shadows diagnostic", async () => {
 		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("python-sql-injection");

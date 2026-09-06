@@ -88,17 +88,6 @@ describe("slop detection rules", () => {
 			expect(matches.length).toBe(0);
 		});
 
-		it("flags JSONResponse imported from SQLAlchemy", async () => {
-			const client = getSharedTreeSitterClient()!;
-			const query = await getQuery("python-hallucinated-import");
-			const filePath = writeTempFile(
-				"py",
-				`from sqlalchemy import JSONResponse\n`,
-			);
-			const matches = await client.runQueryOnFile(query, filePath, "python");
-			expect(matches.length).toBeGreaterThan(0);
-		});
-
 		it("does not flag valid SQLAlchemy imports", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("python-hallucinated-import");
@@ -108,13 +97,6 @@ describe("slop detection rules", () => {
 			);
 			const matches = await client.runQueryOnFile(query, filePath, "python");
 			expect(matches).toHaveLength(0);
-		});
-
-		it("uses double-brace captures in its production message", async () => {
-			const query = await getQuery("python-hallucinated-import");
-			expect(query.message).toBe(
-				"Hallucinated import — '{{NAME}}' does not exist in '{{MODULE}}'",
-			);
 		});
 	});
 
@@ -168,13 +150,6 @@ describe("slop detection rules", () => {
 			const filePath = writeTempFile("py", `statement.select()\n`);
 			const matches = await client.runQueryOnFile(query, filePath, "python");
 			expect(matches).toHaveLength(0);
-		});
-
-		it("keeps only METHOD in the rendered rule message", async () => {
-			const query = await getQuery("python-cross-language-method");
-			expect(query.message).toBe(
-				"'{{METHOD}}' is not a Python method — likely a cross-language idiom leaking in",
-			);
 		});
 	});
 

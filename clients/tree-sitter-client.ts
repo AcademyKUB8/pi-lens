@@ -62,6 +62,10 @@ import { TreeSitterNavigator } from "./tree-sitter-navigator.js";
 import {
 	isProvenSqlAlchemySessionReceiver,
 	isSafePsycopgIdentifierComposition,
+	isSqlAlchemyStatementArgument,
+	PYTHON_SQLALCHEMY_RECEIVER_NAMES,
+	PYTHON_SQLALCHEMY_STATEMENT_BUILDERS,
+	PYTHON_SQLALCHEMY_STATEMENT_METHODS,
 } from "./python-provenance.js";
 import {
 	type TreeSitterQuery,
@@ -84,75 +88,14 @@ const QUERY_BATCH_MAX_LOAD_FAILURES = 3;
 // must not stall the batched query walk; the filter fails open when this cap
 // is reached so unrelated diagnostics and the current match are preserved.
 const NO_NESTED_ANCHOR_VISIT_CAP = 10_000;
-const LEGACY_PYTHON_HALLUCINATED_IMPORT_MODULES: ReadonlySet<string> = new Set([
-	"requests",
-	"flask",
-	"django",
-	"typing",
-	"collections",
-	"asyncio",
-	"json",
-	"unittest",
-	"pytest",
-	"urllib",
-]);
-const LEGACY_PYTHON_HALLUCINATED_IMPORT_NAMES: ReadonlySet<string> = new Set([
-	"JSONResponse",
-	"HTMLResponse",
-	"RedirectResponse",
-	"StreamingResponse",
-	"Depends",
-	"Query",
-	"Path",
-	"Body",
-	"Header",
-	"Cookie",
-	"Form",
-	"File",
-	"UploadFile",
-	"FastAPI",
-	"APIRouter",
-	"HTTPException",
-	"BackgroundTasks",
-	"dataclass",
-	"fields",
-	"BaseModel",
-	"Field",
-	"validator",
-	"aiohttp",
-	"parse",
-	"stringify",
-	"fixture",
-	"TestCase",
-	"get",
-	"post",
-	"put",
-	"delete",
-	"Model",
-	"Session",
-	"Column",
-	"Integer",
-	"String",
-]);
+// The execute-style Python DB-API/ORM methods this rule treats as SQL sinks.
+// Hoisted so the post-filter does not rebuild the set per match.
 const PYTHON_SQL_SINK_METHODS: ReadonlySet<string> = new Set([
 	"execute",
 	"executemany",
 	"query",
 	"raw",
-	"scalar",
-	"scalars",
 ]);
-
-function isKnownPythonHallucinatedImport(
-	moduleName: string,
-	importedName: string,
-): boolean {
-	if (moduleName === "sqlalchemy") return importedName === "JSONResponse";
-	return (
-		LEGACY_PYTHON_HALLUCINATED_IMPORT_MODULES.has(moduleName) &&
-		LEGACY_PYTHON_HALLUCINATED_IMPORT_NAMES.has(importedName)
-	);
-}
 
 // --- Type Declarations (local, no import needed) ---
 
@@ -2366,6 +2309,18 @@ export class TreeSitterClient {
 	}
 
 	/**
+	 * SQLAlchemy sessions are conventionally bound to one of a handful of
+	 * receiver names. Structural provenance (`python-provenance.ts`) proves the
+	 * annotated case; this name check keeps the far more common unannotated
+	 * `session.execute(stmt)` quiet, as it has been since the exemption was
+	 * added. Removing it regresses every codebase that never annotates.
+	 */
+	private isLikelySqlAlchemyReceiver(text: string): boolean {
+		const tail = text.split(".").pop() ?? text;
+		return PYTHON_SQLALCHEMY_RECEIVER_NAMES.has(tail.toLowerCase());
+	}
+
+	/**
 	 * The body statements of a `switch_case`, in order. A switch_case's named
 	 * children are `[value, ...statements]` (its statements are direct children,
 	 * not a wrapping statement_block), so drop the leading `case <value>` and any
@@ -2963,6 +2918,20 @@ export class TreeSitterClient {
 		const object = member.childForFieldName?.("object");
 		if (object?.type !== "identifier") return null;
 		return object.text;
+	}
+
+	/**
+	 * `session.execute(select(...))` and friends pass a statement OBJECT, not a
+	 * SQL string: parameterized by construction, and far too noisy as blockers.
+	 */
+	private isSafeSqlAlchemyExpressionCall(node: TreeSitterNode): boolean {
+		if (node.type !== "call") return false;
+		const callee = node.children?.[0]?.text ?? "";
+		const expression = node.text;
+		for (const name of PYTHON_SQLALCHEMY_STATEMENT_BUILDERS) {
+			if (callee === name || expression.startsWith(`${name}(`)) return true;
+		}
+		return false;
 	}
 
 	/**
@@ -4150,22 +4119,42 @@ export class TreeSitterClient {
 						captures.FN?.text ?? "",
 					)
 				);
-			case "py_hallucinated_import": {
-				const moduleName = captures.MODULE?.text ?? "";
-				const importedName = captures.NAME?.text ?? "";
-				return isKnownPythonHallucinatedImport(moduleName, importedName);
-			}
 			case "py_sql_injection_sink": {
 				const fn = captures.FN?.text ?? "";
 				if (!PYTHON_SQL_SINK_METHODS.has(fn)) return false;
 
+				const sqlNode = captures.SQL;
+				const receiver = captures.OBJ;
+
+				// Pre-existing exemptions — kept verbatim so no current user
+				// regresses (#2577 review): an unannotated session receiver, and a
+				// statement-builder call in argument position.
 				if (
-					fn === "query" &&
-					isProvenSqlAlchemySessionReceiver(captures.OBJ, rootNode)
+					fn === "execute" &&
+					this.isLikelySqlAlchemyReceiver(receiver?.text ?? "")
 				) {
 					return false;
 				}
-				if (isSafePsycopgIdentifierComposition(captures.SQL, rootNode)) {
+				if (sqlNode && this.isSafeSqlAlchemyExpressionCall(sqlNode)) {
+					return false;
+				}
+
+				// #2576: a receiver PROVEN to be a sqlalchemy Session/AsyncSession.
+				// `Session.query` takes entity classes; the statement methods take a
+				// builder call or a name bound to one (`stmt = select(User)`), which
+				// the argument-position check above cannot see.
+				if (isProvenSqlAlchemySessionReceiver(receiver, rootNode)) {
+					if (fn === "query") return false;
+					if (
+						PYTHON_SQLALCHEMY_STATEMENT_METHODS.has(fn) &&
+						isSqlAlchemyStatementArgument(sqlNode, rootNode)
+					) {
+						return false;
+					}
+				}
+
+				// #2576: psycopg `sql.SQL("...").format(sql.Identifier(...))`.
+				if (isSafePsycopgIdentifierComposition(sqlNode, rootNode)) {
 					return false;
 				}
 				return true;

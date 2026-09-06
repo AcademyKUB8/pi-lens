@@ -185,7 +185,9 @@ export async function detectPythonEnvironment(
 	// the workspace `.venv` candidate and re-anchors a relative
 	// `UV_PROJECT_ENVIRONMENT` at the workspace root.
 	const memberWorkspaceRoot =
-		isProjectRoot && uvWorkspace.explicit && isUvWorkspaceMember(uvWorkspace, root)
+		isProjectRoot &&
+		uvWorkspace.explicit &&
+		isUvWorkspaceMember(uvWorkspace, root)
 			? uvWorkspace.root
 			: undefined;
 	const uvEnvironmentRoot = isProjectRoot

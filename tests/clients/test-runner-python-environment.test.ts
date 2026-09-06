@@ -788,9 +788,7 @@ describe("python environment state space (review round 3)", () => {
 						}
 						let activated: string | undefined;
 						if (virtualEnv === "V-set") {
-							activated = createEnvironment(
-								path.join(base, "activated"),
-							).root;
+							activated = createEnvironment(path.join(base, "activated")).root;
 							process.env.VIRTUAL_ENV = activated;
 						}
 

@@ -503,15 +503,15 @@ def find(db: Session):
 			'db.execute(text("SELECT 1"))': staticText,
 		};
 		const results = await Promise.all(
-			Object.entries(fixtures).map(async ([label, fixture]) => [
-				label,
-				await treeSitterRunner.run(fixture.ctx),
-			] as const),
+			Object.entries(fixtures).map(
+				async ([label, fixture]) =>
+					[label, await treeSitterRunner.run(fixture.ctx)] as const,
+			),
 		);
 		for (const [label, result] of results) {
-			expect.soft(firedRuleIds(result), label).not.toContain(
-				"python-sql-injection",
-			);
+			expect
+				.soft(firedRuleIds(result), label)
+				.not.toContain("python-sql-injection");
 		}
 	}, 30_000);
 
@@ -573,15 +573,15 @@ def find(db: Session, tainted):
 			"stmt bound twice — tainted, then select()": reboundStatement,
 		};
 		const results = await Promise.all(
-			Object.entries(fixtures).map(async ([label, fixture]) => [
-				label,
-				await treeSitterRunner.run(fixture.ctx),
-			] as const),
+			Object.entries(fixtures).map(
+				async ([label, fixture]) =>
+					[label, await treeSitterRunner.run(fixture.ctx)] as const,
+			),
 		);
 		for (const [label, result] of results) {
-			expect.soft(firedRuleIds(result), label).toContain(
-				"python-sql-injection",
-			);
+			expect
+				.soft(firedRuleIds(result), label)
+				.toContain("python-sql-injection");
 		}
 	}, 30_000);
 });

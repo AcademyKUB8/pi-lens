@@ -75,15 +75,12 @@ export const PYTHON_SQLALCHEMY_RECEIVER_NAMES: ReadonlySet<string> = new Set([
 	"sync_session",
 ]);
 /** Statement constructors whose result is an expression object, never a string. */
-export const PYTHON_SQLALCHEMY_STATEMENT_BUILDERS: ReadonlySet<string> = new Set(
-	["select", "insert", "update", "delete"],
-);
+export const PYTHON_SQLALCHEMY_STATEMENT_BUILDERS: ReadonlySet<string> =
+	new Set(["select", "insert", "update", "delete"]);
 /** Session/AsyncSession methods that execute a statement object. */
-export const PYTHON_SQLALCHEMY_STATEMENT_METHODS: ReadonlySet<string> = new Set([
-	"execute",
-	"scalar",
-	"scalars",
-]);
+export const PYTHON_SQLALCHEMY_STATEMENT_METHODS: ReadonlySet<string> = new Set(
+	["execute", "scalar", "scalars"],
+);
 
 const FROM_IMPORT_PROVENANCE = new Map<string, PythonProvenance>([
 	["sqlalchemy.orm:Session", "sqlalchemy-session"],
@@ -171,8 +168,10 @@ function scanBindingNames(
 		scan.unknown = true;
 		return;
 	}
-	const descend = (child: PythonSyntaxNode | undefined, next: BindingScanMode) =>
-		scanBindingNames(child, next, scan, depth + 1);
+	const descend = (
+		child: PythonSyntaxNode | undefined,
+		next: BindingScanMode,
+	) => scanBindingNames(child, next, scan, depth + 1);
 	if (node.type === "as_pattern_target") {
 		descend(namedChildren(node)[0], "target");
 		return;
@@ -496,7 +495,10 @@ function recordDynamicNamespaceHazard(
 	state: SummaryBuildState,
 ): void {
 	const callee = calleeNode(node);
-	if (callee?.type === "identifier" && DYNAMIC_NAMESPACE_BUILTINS.has(callee.text)) {
+	if (
+		callee?.type === "identifier" &&
+		DYNAMIC_NAMESPACE_BUILTINS.has(callee.text)
+	) {
 		markInvalid(state);
 	}
 }
@@ -752,8 +754,10 @@ function isStatementBuilderCall(node: PythonSyntaxNode | undefined): boolean {
 		callee?.type === "identifier"
 			? callee.text
 			: callee?.type === "attribute"
-				? (callee.childForFieldName?.("attribute") ??
-					namedChildren(callee).at(-1))?.text
+				? (
+						callee.childForFieldName?.("attribute") ??
+						namedChildren(callee).at(-1)
+					)?.text
 				: undefined;
 	if (!name) return false;
 	if (PYTHON_SQLALCHEMY_STATEMENT_BUILDERS.has(name)) return true;

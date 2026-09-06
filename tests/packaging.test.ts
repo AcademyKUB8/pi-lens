@@ -86,7 +86,8 @@ describe("published package entry points (dist mode, #182)", () => {
 		//
 		// pi's real resolver — `PackageManager#collectFilesFromManifestEntries` in
 		// `@earendil-works/pi-coding-agent` `dist/core/package-manager.js`
-		// (byte-identical in 0.78.1, 0.84.1 and 0.85.1):
+		// (this non-glob branch is identical in 0.78.1, 0.84.1 and 0.85.1; the
+		// glob branch was refactored into `expandPackageGlob` in 0.85.1):
 		//
 		//     if (!hasGlobPattern(entry)) return [resolve(root, entry)];
 		//

@@ -80,32 +80,71 @@ describe("published package entry points (dist mode, #182)", () => {
 		expect(pkg.scripts?.["build:dist"] ?? "").toContain("tsconfig.dist.json");
 	});
 
-	it("pi.skills resolves (from the dist entry FILE) back to the real root skills/", () => {
-		// pi resolves each `pi.skills` entry relative to the extension entry's
-		// **file path** (`dist/index.js`), via `path.resolve(entryFile, skill)` —
-		// NOT relative to the entry's directory. So a leading `../` only cancels
-		// `index.js` and stays inside `dist/`; reaching the real root `skills/`
-		// from `dist/index.js` needs to climb TWO levels: `../../skills`. Getting
-		// this wrong (`../skills` → `dist/skills`, missing) silently stops skills
-		// from loading and emits pi's "skill path does not exist" warning — and the
-		// tarball `skills/` check below does NOT catch it (the dir ships fine; pi
-		// just resolves to the wrong place). Verified against pi's resolver. #199.
-		expect(pkg.pi?.skills ?? []).toContain("../../skills");
-		expect(pkg.scripts?.["build:dist"] ?? "").not.toContain("dist/skills");
-		expect(pkg.files ?? []).toContain("skills/");
+	it("pi.skills resolves PACKAGE-ROOT-relative and never escapes the package (#2587)", () => {
+		// Guards the recurrence of #2587: a `pi.skills` entry that leaves the
+		// package, so none of the shipped skills register on any install.
+		//
+		// pi's real resolver — `PackageManager#collectFilesFromManifestEntries` in
+		// `@earendil-works/pi-coding-agent` `dist/core/package-manager.js`
+		// (this non-glob branch is identical in 0.78.1, 0.84.1 and 0.85.1; the
+		// glob branch was refactored into `expandPackageGlob` in 0.85.1):
+		//
+		//     if (!hasGlobPattern(entry)) return [resolve(root, entry)];
+		//
+		// where `root` is the PACKAGE ROOT (the dir holding package.json), passed
+		// down from `addManifestEntries(entries, packageRoot, …)`. It is NOT the
+		// extension entry file and NOT `dist/`. #199 assumed entry-file-relative
+		// resolution and set `["../../skills"]`; from any real install root
+		// (`…/node_modules/pi-lens`) that lands two levels OUTSIDE the package, so
+		// pi loaded zero skills everywhere — and the #199 test replicated the
+		// guessed resolver instead of pi's, so CI stayed green for four releases.
+		const resolveLikePi = (packageRoot: string, entry: string) =>
+			path.resolve(packageRoot, entry);
+		const inside = (packageRoot: string, resolved: string) =>
+			resolved === packageRoot || resolved.startsWith(packageRoot + path.sep);
 
-		// Static guard replicating pi's resolution: joining each pi.skills entry to
-		// the extension entry FILE must land on the package's own root skills/ dir.
-		const entry = pkg.pi?.extensions?.[0];
-		expect(entry, "pi.extensions[0] must exist").toBeTruthy();
-		const entryFile = path.resolve(root, entry as string);
+		const skills = pkg.pi?.skills ?? [];
+		expect(
+			skills.length,
+			"pi.skills must declare the shipped dir",
+		).toBeGreaterThan(0);
+		expect(pkg.files ?? [], "skills/ must ship in the tarball").toContain(
+			"skills/",
+		);
+		// One skills tree only: a second copy under dist/ would ship dead weight.
+		expect(pkg.scripts?.["build:dist"] ?? "").not.toContain("dist/skills");
+
+		// The published package root is wherever the installer puts it, so assert
+		// containment against a SYNTHETIC root too — the property belongs to the
+		// entry string, not to this checkout's location on disk.
+		const installRoot = path.resolve(
+			path.sep,
+			"pi",
+			"agent",
+			"npm",
+			"node_modules",
+			"pi-lens",
+		);
 		const rootSkills = path.resolve(root, "skills");
-		for (const skill of pkg.pi?.skills ?? []) {
+		for (const entry of skills) {
+			// The replication above only covers pi's non-glob branch.
 			expect(
-				path.resolve(entryFile, skill),
-				`pi.skills "${skill}" must resolve (entry-file-relative) to the root skills/ dir`,
+				/[*?]/.test(entry),
+				`pi.skills "${entry}" must not be a glob (pi takes a different branch)`,
+			).toBe(false);
+			expect(
+				resolveLikePi(root, entry),
+				`pi.skills "${entry}" must resolve (package-root-relative) to the root skills/ dir`,
 			).toBe(rootSkills);
+			expect(
+				inside(installRoot, resolveLikePi(installRoot, entry)),
+				`pi.skills "${entry}" escapes the installed package: ${resolveLikePi(installRoot, entry)}`,
+			).toBe(true);
 		}
+		expect(
+			fs.existsSync(path.join(rootSkills, "pi-lens-ast-grep", "SKILL.md")),
+			"the resolved skills dir must actually hold SKILL.md files",
+		).toBe(true);
 	});
 
 	it("bundles core grammars via prepare and ships them in the tarball", () => {

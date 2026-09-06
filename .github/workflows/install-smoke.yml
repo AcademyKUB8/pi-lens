@@ -8,7 +8,10 @@ name: install-smoke
 #            resolver is the strictest (it's where #285/#335's `ResolveMessage`
 #            comes from), so the selftest force-imports the documented
 #            failure-point modules (file-utils -> minimatch, complexity-client ->
-#            typescript, bootstrap) and resolves the bare deps directly. No model.
+#            typescript, bootstrap) and resolves the bare deps directly, and
+#            resolves the `pi.skills` manifest entries the way pi does from the
+#            INSTALLED package root — the layout where #2587's `../../skills`
+#            escaped the package and loaded no skills. No model.
 #
 # - pi-load: installs pi ITSELF the way users do (npm/pnpm/bun global + the curl
 #            installer), `pi install npm:pi-lens` through pi's own installer +

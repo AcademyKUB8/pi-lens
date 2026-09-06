@@ -148,7 +148,7 @@
 			"./dist/index.js"
 		],
 		"skills": [
-			"../../skills"
+			"./skills"
 		]
 	},
 	"knip": {

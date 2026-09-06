@@ -658,8 +658,10 @@ jobs:
             echo "ERROR: dist/index.js missing from tarball"
             exit 1
           }
-          # Skills ship at package root (skills/); pi.skills is "../../skills",
-          # resolved relative to dist/index.js back to root.
+          # Skills ship at package root (skills/), and pi.skills is "./skills":
+          # pi resolves a non-glob manifest entry against the PACKAGE ROOT
+          # (collectFilesFromManifestEntries), so anything with ../ escapes the
+          # published package and loads nothing (#2587).
           tar -tzf "$TARBALL" | grep "package/skills/" || {
             echo "ERROR: skills/ missing from tarball"
             exit 1

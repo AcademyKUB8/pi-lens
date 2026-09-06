@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import {
 	extractTomlTableSection,
+	hasTomlTable,
 	parseTomlStringArray,
 } from "./cargo-manifest.js";
 import { minimatch } from "./deps/minimatch.js";
@@ -24,9 +25,11 @@ export interface PythonEnvironment {
 }
 
 interface UvWorkspace {
+	/** The workspace root — the project itself unless an ancestor declares one. */
 	root: string;
+	/** True when {@link root} declares `[tool.uv.workspace]`. */
 	explicit: boolean;
-	startIsProject: boolean;
+	/** The nearest ancestor (inclusive) holding a `pyproject.toml`. */
 	projectRoot: string;
 	members: string[];
 	exclude: string[];
@@ -38,17 +41,22 @@ const UV_WORKSPACE_TABLE = "tool\\.uv\\.workspace";
  * Resolve the uv workspace root using the same discovery shape as uv:
  * start at the nearest pyproject, then continue upward for an explicit
  * `[tool.uv.workspace]` declaration. A nearest pyproject without that table
- * is an implicit single-project workspace. The walk is bounded and stops at
- * HOME so an unrelated ancestor cannot supply the environment.
+ * is an implicit single-project workspace.
+ *
+ * The walk stops AT `homeDir` (`isAtOrAboveHomeDir`, the shared ceiling
+ * primitive from #625) so a `pyproject.toml` sitting in `/tmp`, `/home`, or
+ * `$HOME` itself cannot supply the environment for every project beneath it.
+ * `homeDir` is injected rather than read from `os.homedir()` inside the walk
+ * for the same reason every sibling walker takes it (#2536, #2544 F2): the
+ * ceiling is otherwise untestable.
  */
 async function findUvWorkspace(
 	startDir: string,
+	homeDir: string,
 ): Promise<UvWorkspace | undefined> {
-	const resolvedStart = path.resolve(startDir);
 	let nearestProject: string | undefined;
-	let depth = 0;
 	for (const dir of walkUpDirs(startDir)) {
-		if (depth++ >= 64 || isAtOrAboveHomeDir(dir, os.homedir())) break;
+		if (isAtOrAboveHomeDir(dir, homeDir)) break;
 
 		let content: string;
 		try {
@@ -58,7 +66,7 @@ async function findUvWorkspace(
 		}
 
 		if (!nearestProject) nearestProject = dir;
-		if (hasUvWorkspaceTable(content)) {
+		if (hasTomlTable(content, UV_WORKSPACE_TABLE)) {
 			const workspaceTable = extractTomlTableSection(
 				content,
 				UV_WORKSPACE_TABLE,
@@ -66,7 +74,6 @@ async function findUvWorkspace(
 			return {
 				root: dir,
 				explicit: true,
-				startIsProject: dir === resolvedStart,
 				projectRoot: nearestProject,
 				members: parseTomlStringArray(workspaceTable, "members"),
 				exclude: parseTomlStringArray(workspaceTable, "exclude"),
@@ -78,7 +85,6 @@ async function findUvWorkspace(
 		? {
 				root: nearestProject,
 				explicit: false,
-				startIsProject: nearestProject === resolvedStart,
 				projectRoot: nearestProject,
 				members: [],
 				exclude: [],
@@ -86,24 +92,38 @@ async function findUvWorkspace(
 		: undefined;
 }
 
-/** Match only the top-level uv workspace table, not a commented heading. */
-function hasUvWorkspaceTable(content: string): boolean {
-	return extractTomlTableSection(content, UV_WORKSPACE_TABLE) !== undefined;
-}
-
 /**
  * Apply uv's explicit-workspace membership rules before inheriting its root
  * environment. The workspace root is always a member; descendants must match
  * a declared member glob and must not match an exclusion glob.
+ *
+ * The glob dialect is pinned to uv 3c979abda4530fe9bf3d92e9bcf5c5575e3b3126,
+ * `crates/uv-workspace/src/workspace.rs` `is_included_in_workspace`: patterns
+ * are normalized first (`normalize_path`, so a leading `./` is not part of the
+ * pattern) and matched with `MatchOptions { require_literal_separator: true,
+ * ..MatchOptions::new() }` — case-SENSITIVE on every platform, `*`/`?` confined
+ * to one path component, and no literal-leading-dot requirement. minimatch's
+ * defaults are that dialect exactly once `dot: true` is set, so no options
+ * beyond `dot` are passed: a `nocase` flag here would diverge from uv on
+ * Windows rather than match it.
+ *
+ * KNOWN LIMITATION (documented rather than implemented, same shape as
+ * `matchesCargoWorkspacePattern`'s `**` note): uv matches `exclude` with
+ * `Pattern::matches_path`, i.e. `MatchOptions::new()` defaults, where
+ * `require_literal_separator` is FALSE and a `*` therefore crosses `/`.
+ * minimatch cannot express that, so an exclusion glob relying on a
+ * separator-crossing `*` (`exclude = ['packages/a*c']` for `packages/a/b/c`)
+ * under-excludes: the project keeps its own environment instead of being
+ * excluded from a workspace it was already not going to inherit. Both
+ * outcomes fall back to the project's own `.venv`.
  */
 function isUvWorkspaceMember(
 	workspace: UvWorkspace,
 	projectRoot: string,
 ): boolean {
-	const resolvedProject = path.resolve(projectRoot);
-	if (resolvedProject === workspace.root) return true;
+	if (projectRoot === workspace.root) return true;
 
-	const relative = toPosix(path.relative(workspace.root, resolvedProject));
+	const relative = toPosix(path.relative(workspace.root, projectRoot));
 	if (
 		relative.length === 0 ||
 		relative === ".." ||
@@ -113,20 +133,9 @@ function isUvWorkspaceMember(
 		return false;
 	}
 
-	const minimatchOptions = {
-		dot: true,
-		nocase: process.platform === "win32",
-	};
-	if (
-		workspace.exclude.some((pattern) =>
-			minimatch(relative, toPosix(pattern), minimatchOptions),
-		)
-	) {
-		return false;
-	}
-	return workspace.members.some((pattern) =>
-		minimatch(relative, toPosix(pattern), minimatchOptions),
-	);
+	const matches = (pattern: string): boolean =>
+		minimatch(relative, path.posix.normalize(toPosix(pattern)), { dot: true });
+	return !workspace.exclude.some(matches) && workspace.members.some(matches);
 }
 
 /**
@@ -135,15 +144,28 @@ function isUvWorkspaceMember(
  */
 export async function detectPythonEnvironment(
 	projectRoot: string,
+	homeDir: string = os.homedir(),
 ): Promise<PythonEnvironment | undefined> {
-	const uvWorkspace = await findUvWorkspace(projectRoot);
-	const workspaceMember =
+	const root = path.resolve(projectRoot);
+	const uvWorkspace = await findUvWorkspace(root, homeDir);
+	// Only a DECLARED, non-excluded member of an explicit workspace inherits
+	// that workspace's `.venv` and resolves `UV_PROJECT_ENVIRONMENT` against
+	// the workspace root; every other project is its own single-project
+	// workspace rooted at its own `pyproject.toml`.
+	const memberWorkspaceRoot =
 		uvWorkspace?.explicit === true &&
-		isUvWorkspaceMember(uvWorkspace, uvWorkspace.projectRoot);
-	const workspaceRoot =
-		uvWorkspace && (!uvWorkspace.explicit || workspaceMember)
+		isUvWorkspaceMember(uvWorkspace, uvWorkspace.projectRoot)
 			? uvWorkspace.root
-			: path.resolve(projectRoot);
+			: undefined;
+	// `UV_PROJECT_ENVIRONMENT` is a uv PROJECT setting: uv reads it only after
+	// discovering a `pyproject.toml`, and resolves a relative value against
+	// that project's workspace root — never against the cwd, and never for a
+	// directory with no project above it. Exporting it process-wide is uv's
+	// own documented CI/Docker recipe, so an unconditional candidate would let
+	// one image-level variable hijack every unrelated checkout on the box.
+	const uvEnvironmentRoot = uvWorkspace
+		? (memberWorkspaceRoot ?? uvWorkspace.projectRoot)
+		: undefined;
 	const uvProjectEnvironment = process.env.UV_PROJECT_ENVIRONMENT;
 	// PEP 723 `uv run --script` environments are cache-keyed by script content;
 	// without a stable project marker or explicit path, they remain undiscoverable.
@@ -151,37 +173,28 @@ export async function detectPythonEnvironment(
 		root: string | undefined;
 		source: PythonEnvironmentSource;
 	}> = [
-		{
-			root: uvProjectEnvironment
-				? path.isAbsolute(uvProjectEnvironment)
-					? uvProjectEnvironment
-					: path.resolve(workspaceRoot, uvProjectEnvironment)
-				: undefined,
-			source: "uv-project-environment",
-		},
-		...(uvWorkspace?.explicit && workspaceMember
+		...(uvEnvironmentRoot !== undefined && uvProjectEnvironment
 			? [
 					{
-						root: path.join(workspaceRoot, ".venv"),
+						// `path.resolve` leaves an absolute value untouched and
+						// anchors a relative one at the project's workspace root.
+						root: path.resolve(uvEnvironmentRoot, uvProjectEnvironment),
+						source: "uv-project-environment" as const,
+					},
+				]
+			: []),
+		...(memberWorkspaceRoot !== undefined
+			? [
+					{
+						root: path.join(memberWorkspaceRoot, ".venv"),
 						source: "uv-workspace" as const,
 					},
 				]
 			: []),
 		{ root: process.env.VIRTUAL_ENV, source: "virtual-env" },
 		{ root: process.env.CONDA_PREFIX, source: "conda" },
-		{ root: path.join(projectRoot, ".venv"), source: "project-dot-venv" },
-		{ root: path.join(projectRoot, "venv"), source: "project-venv" },
-		...(uvWorkspace &&
-		!uvWorkspace.explicit &&
-		!uvWorkspace.startIsProject &&
-		workspaceRoot !== path.resolve(projectRoot)
-			? [
-					{
-						root: path.join(workspaceRoot, ".venv"),
-						source: "project-dot-venv" as const,
-					},
-				]
-			: []),
+		{ root: path.join(root, ".venv"), source: "project-dot-venv" },
+		{ root: path.join(root, "venv"), source: "project-venv" },
 	];
 
 	for (const candidate of candidates) {

@@ -33,6 +33,7 @@ vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 	safeSpawnAsync,
 }));
 
+import { detectPythonEnvironment } from "../../clients/python-environment.js";
 import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
 
 const tempDirs: string[] = [];
@@ -48,34 +49,73 @@ function restoreEnvironmentVariable(
 	else process.env[name] = value;
 }
 
-function createProject(withVenv: boolean): {
-	root: string;
-	testFile: string;
-	pythonPath: string;
-	binDir: string;
-} {
-	const root = fs.mkdtempSync(
-		path.join(os.tmpdir(), "pi-lens-pytest-environment-"),
-	);
-	tempDirs.push(root);
-	const testFile = path.join(root, "tests", "test_example.py");
-	fs.mkdirSync(path.dirname(testFile), { recursive: true });
-	fs.writeFileSync(testFile, "def test_example():\n    assert True\n");
+function createTempDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	tempDirs.push(dir);
+	return dir;
+}
 
+/** Materialize a venv-shaped directory (the layout `detectPythonEnvironment` probes). */
+function createEnvironment(root: string): {
+	root: string;
+	binDir: string;
+	pythonPath: string;
+} {
 	const binDir = path.join(
 		root,
-		".venv",
 		process.platform === "win32" ? "Scripts" : "bin",
 	);
 	const pythonPath = path.join(
 		binDir,
 		process.platform === "win32" ? "python.exe" : "python",
 	);
-	if (withVenv) {
-		fs.mkdirSync(binDir, { recursive: true });
-		fs.writeFileSync(pythonPath, "");
-	}
+	fs.mkdirSync(binDir, { recursive: true });
+	fs.writeFileSync(pythonPath, "");
+	return { root, binDir, pythonPath };
+}
+
+/** Materialize a `<dir>/tests/test_example.py` and return its path. */
+function createTestFile(dir: string): string {
+	const testFile = path.join(dir, "tests", "test_example.py");
+	fs.mkdirSync(path.dirname(testFile), { recursive: true });
+	fs.writeFileSync(testFile, "def test_example():\n    assert True\n");
+	return testFile;
+}
+
+function createProject(withVenv: boolean): {
+	root: string;
+	testFile: string;
+	pythonPath: string;
+	binDir: string;
+} {
+	const root = createTempDir("pi-lens-pytest-environment-");
+	const testFile = createTestFile(root);
+	const dotVenv = path.join(root, ".venv");
+	const binDir = path.join(
+		dotVenv,
+		process.platform === "win32" ? "Scripts" : "bin",
+	);
+	const pythonPath = path.join(
+		binDir,
+		process.platform === "win32" ? "python.exe" : "python",
+	);
+	if (withVenv) createEnvironment(dotVenv);
 	return { root, testFile, pythonPath, binDir };
+}
+
+async function runPytest(
+	testFile: string,
+	projectRoot: string,
+): Promise<{ command: string; options: SafeSpawnOptions }> {
+	await new TestRunnerClient(false).runTestFileAsync(
+		testFile,
+		projectRoot,
+		"pytest",
+		RUNNERS.pytest,
+	);
+	const [command, , options] = safeSpawnAsync.mock.calls[0];
+	if (!options) throw new Error("pytest spawn options were not supplied");
+	return { command, options };
 }
 
 describe("pytest project environment", () => {
@@ -143,47 +183,163 @@ describe("pytest project environment", () => {
 		expect(options.env).toBeUndefined();
 	});
 
-	it("uses an absolute UV_PROJECT_ENVIRONMENT path", async () => {
+	it("uses an absolute UV_PROJECT_ENVIRONMENT path for a uv project", async () => {
 		const { root, testFile } = createProject(false);
-		const uvEnvironmentRoot = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-uv-project-env-"),
+		fs.writeFileSync(
+			path.join(root, "pyproject.toml"),
+			"[project]\nname='app'\n",
 		);
-		const binDir = path.join(
-			uvEnvironmentRoot,
-			process.platform === "win32" ? "Scripts" : "bin",
+		const uvEnvironment = createEnvironment(
+			createTempDir("pi-lens-uv-project-env-"),
 		);
-		const pythonPath = path.join(
-			binDir,
-			process.platform === "win32" ? "python.exe" : "python",
-		);
-		fs.mkdirSync(binDir, { recursive: true });
-		fs.writeFileSync(pythonPath, "");
-		process.env.UV_PROJECT_ENVIRONMENT = uvEnvironmentRoot;
+		process.env.UV_PROJECT_ENVIRONMENT = uvEnvironment.root;
 
-		try {
-			await new TestRunnerClient(false).runTestFileAsync(
-				testFile,
-				root,
-				"pytest",
-				RUNNERS.pytest,
-			);
+		const { command, options } = await runPytest(testFile, root);
 
-			const [command, , options] = safeSpawnAsync.mock.calls[0];
-			if (!options) throw new Error("pytest spawn options were not supplied");
-			expect(command).toBe(pythonPath);
-			expect(options.env?.VIRTUAL_ENV).toBe(uvEnvironmentRoot);
-			expect(options.env?.PATH?.split(path.delimiter)[0]).toBe(binDir);
-		} finally {
-			fs.rmSync(uvEnvironmentRoot, { recursive: true, force: true });
-		}
+		expect(command).toBe(uvEnvironment.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(uvEnvironment.root);
+		expect(options.env?.PATH?.split(path.delimiter)[0]).toBe(
+			uvEnvironment.binDir,
+		);
+	});
+
+	// uv's documented CI/Docker recipe exports UV_PROJECT_ENVIRONMENT process-
+	// wide (docs/concepts/projects/config.md). It is a uv *project* setting:
+	// `uv` only honors it after discovering a pyproject.toml, so an exported
+	// value must not hijack a directory that is not a uv project at all —
+	// AGENTS.md defect shape 13 (an ambient signal outranking the specific
+	// one). Guard for: an exported UV_PROJECT_ENVIRONMENT outranking a
+	// non-uv project's own `.venv` / activated VIRTUAL_ENV (review round 2, F1).
+	it("ignores an exported UV_PROJECT_ENVIRONMENT outside a uv project", async () => {
+		const { root, testFile, pythonPath } = createProject(true);
+		const exported = createEnvironment(createTempDir("pi-lens-uv-ci-env-"));
+		process.env.UV_PROJECT_ENVIRONMENT = exported.root;
+
+		const { command, options } = await runPytest(testFile, root);
+
+		expect(command).toBe(pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(path.join(root, ".venv"));
+	});
+
+	it("keeps an activated VIRTUAL_ENV over an exported UV_PROJECT_ENVIRONMENT outside a uv project", async () => {
+		const { root, testFile } = createProject(false);
+		const activated = createEnvironment(
+			createTempDir("pi-lens-activated-env-"),
+		);
+		const exported = createEnvironment(createTempDir("pi-lens-uv-ci-env-"));
+		process.env.VIRTUAL_ENV = activated.root;
+		process.env.UV_PROJECT_ENVIRONMENT = exported.root;
+
+		const { command, options } = await runPytest(testFile, root);
+
+		expect(command).toBe(activated.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(activated.root);
+	});
+
+	// uv resolves a relative UV_PROJECT_ENVIRONMENT against the workspace root
+	// of the project it discovered, never against the directory it was handed
+	// (uv 3c979abda4530fe9bf3d92e9bcf5c5575e3b3126,
+	// crates/uv-workspace/src/workspace.rs). pi-lens hands this resolver a
+	// dispatch cwd / LSP root, which can sit BELOW the pyproject.toml that
+	// defines the project (review round 2, F2).
+	it("resolves a relative UV_PROJECT_ENVIRONMENT from the discovered project root", async () => {
+		const workspace = createProject(false);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[tool.uv.workspace]\nmembers = ['packages/*']\n",
+		);
+		// Not a member of the workspace above it, so it is its own single-
+		// project workspace: `.uv-env` resolves against ITS root, not against
+		// the `tests/` subdirectory pi-lens happens to hand the resolver.
+		const standalone = path.join(workspace.root, "tools", "standalone");
+		const testFile = createTestFile(standalone);
+		fs.writeFileSync(
+			path.join(standalone, "pyproject.toml"),
+			"[project]\nname='standalone'\n",
+		);
+		const expected = createEnvironment(path.join(standalone, ".uv-env"));
+		process.env.UV_PROJECT_ENVIRONMENT = ".uv-env";
+
+		const { command, options } = await runPytest(
+			testFile,
+			path.dirname(testFile),
+		);
+
+		expect(command).toBe(expected.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(expected.root);
+	});
+
+	// The resolver walks up for a pyproject.toml, so an ancestor project's
+	// `.venv` is reachable from any descendant directory. Inheriting it is
+	// wrong for every non-uv-workspace layout: a poetry (or plain PEP 621)
+	// root does not lend its environment to a sibling subtree that is not a
+	// Python project at all. Guard for: ancestor-`.venv` inheritance outside
+	// an explicit uv workspace (review round 2, F3).
+	it("does not inherit an ancestor project's .venv from a subdirectory", async () => {
+		const { root } = createProject(false);
+		fs.writeFileSync(
+			path.join(root, "pyproject.toml"),
+			"[tool.poetry]\nname='mono'\n",
+		);
+		createEnvironment(path.join(root, ".venv"));
+		const frontend = path.join(root, "frontend");
+		const testFile = createTestFile(frontend);
+
+		const { command, options } = await runPytest(testFile, frontend);
+
+		expect(command).toBe("python");
+		expect(options.env).toBeUndefined();
+	});
+
+	// `walkUpDirs` is unbounded, so without the HOME ceiling a pyproject.toml
+	// sitting in `/tmp` (or any ancestor above the user's home) supplies the
+	// environment for every project below it. `isAtOrAboveHomeDir` is the
+	// shared ceiling primitive (#625), and `homeDir` is injected the way every
+	// sibling walker takes it (#2536/#2544 F2). Guard for: the walk reading a
+	// pyproject.toml at or above $HOME (review round 2, F6).
+	it("stops the uv project walk at the home directory", async () => {
+		const base = createTempDir("pi-lens-uv-home-ceiling-");
+		const homeDir = path.join(base, "home");
+		const project = path.join(homeDir, "project");
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(
+			path.join(base, "pyproject.toml"),
+			"[project]\nname='above-home'\n",
+		);
+		createEnvironment(path.join(base, ".uv-env"));
+		process.env.UV_PROJECT_ENVIRONMENT = ".uv-env";
+
+		expect(await detectPythonEnvironment(project, homeDir)).toBeUndefined();
+	});
+
+	// uv normalizes a member glob before matching it, so a leading `./` is not
+	// part of the pattern (uv 3c979abda4530fe9bf3d92e9bcf5c5575e3b3126,
+	// `is_included_in_workspace` -> `normalize_path`, and the upstream fixture
+	// `exclude_package_with_normalized_glob_and_escaped_root`).
+	it("matches a uv member glob written with a leading ./", async () => {
+		const workspace = createProject(false);
+		const member = path.join(workspace.root, "packages", "member");
+		const memberTestFile = createTestFile(member);
+		fs.writeFileSync(
+			path.join(workspace.root, "pyproject.toml"),
+			"[tool.uv.workspace]\nmembers = ['./packages/*']\n",
+		);
+		fs.writeFileSync(
+			path.join(member, "pyproject.toml"),
+			"[project]\nname='member'\n",
+		);
+		const expected = createEnvironment(path.join(workspace.root, ".venv"));
+
+		const { command, options } = await runPytest(memberTestFile, member);
+
+		expect(command).toBe(expected.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(expected.root);
 	});
 
 	it("resolves a relative UV_PROJECT_ENVIRONMENT from the workspace root", async () => {
 		const workspace = createProject(false);
 		const member = path.join(workspace.root, "packages", "member");
-		const memberTestFile = path.join(member, "tests", "test_example.py");
-		fs.mkdirSync(path.dirname(memberTestFile), { recursive: true });
-		fs.writeFileSync(memberTestFile, "def test_example():\n    assert True\n");
+		const memberTestFile = createTestFile(member);
 		fs.writeFileSync(
 			path.join(workspace.root, "pyproject.toml"),
 			"[tool.uv.workspace]\nmembers = ['packages/*']\n",
@@ -192,39 +348,19 @@ describe("pytest project environment", () => {
 			path.join(member, "pyproject.toml"),
 			"[project]\nname='member'\n",
 		);
-
-		const uvEnvironmentRoot = path.join(workspace.root, ".uv-env");
-		const binDir = path.join(
-			uvEnvironmentRoot,
-			process.platform === "win32" ? "Scripts" : "bin",
-		);
-		const pythonPath = path.join(
-			binDir,
-			process.platform === "win32" ? "python.exe" : "python",
-		);
-		fs.mkdirSync(binDir, { recursive: true });
-		fs.writeFileSync(pythonPath, "");
+		const expected = createEnvironment(path.join(workspace.root, ".uv-env"));
 		process.env.UV_PROJECT_ENVIRONMENT = ".uv-env";
 
-		await new TestRunnerClient(false).runTestFileAsync(
-			memberTestFile,
-			member,
-			"pytest",
-			RUNNERS.pytest,
-		);
+		const { command, options } = await runPytest(memberTestFile, member);
 
-		const [command, , options] = safeSpawnAsync.mock.calls[0];
-		if (!options) throw new Error("pytest spawn options were not supplied");
-		expect(command).toBe(pythonPath);
-		expect(options.env?.VIRTUAL_ENV).toBe(uvEnvironmentRoot);
+		expect(command).toBe(expected.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(expected.root);
 	});
 
 	it("uses the uv workspace .venv for a member package", async () => {
 		const workspace = createProject(false);
 		const member = path.join(workspace.root, "packages", "member");
-		const memberTestFile = path.join(member, "tests", "test_example.py");
-		fs.mkdirSync(path.dirname(memberTestFile), { recursive: true });
-		fs.writeFileSync(memberTestFile, "def test_example():\n    assert True\n");
+		const memberTestFile = createTestFile(member);
 		fs.writeFileSync(
 			path.join(workspace.root, "pyproject.toml"),
 			"[tool.uv.workspace]\nmembers = ['packages/*']\n",
@@ -233,30 +369,12 @@ describe("pytest project environment", () => {
 			path.join(member, "pyproject.toml"),
 			"[project]\nname='member'\n",
 		);
+		const expected = createEnvironment(path.join(workspace.root, ".venv"));
 
-		const binDir = path.join(
-			workspace.root,
-			".venv",
-			process.platform === "win32" ? "Scripts" : "bin",
-		);
-		const pythonPath = path.join(
-			binDir,
-			process.platform === "win32" ? "python.exe" : "python",
-		);
-		fs.mkdirSync(binDir, { recursive: true });
-		fs.writeFileSync(pythonPath, "");
+		const { command, options } = await runPytest(memberTestFile, member);
 
-		await new TestRunnerClient(false).runTestFileAsync(
-			memberTestFile,
-			member,
-			"pytest",
-			RUNNERS.pytest,
-		);
-
-		const [command, , options] = safeSpawnAsync.mock.calls[0];
-		if (!options) throw new Error("pytest spawn options were not supplied");
-		expect(command).toBe(pythonPath);
-		expect(options.env?.VIRTUAL_ENV).toBe(path.join(workspace.root, ".venv"));
+		expect(command).toBe(expected.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(expected.root);
 	});
 
 	it("keeps an independent nested project on its own .venv", async () => {
@@ -265,49 +383,20 @@ describe("pytest project environment", () => {
 			path.join(workspace.root, "pyproject.toml"),
 			"[tool.uv.workspace]\nmembers = ['packages/*']\n",
 		);
-		const workspaceBinDir = path.join(
-			workspace.root,
-			".venv",
-			process.platform === "win32" ? "Scripts" : "bin",
-		);
-		const workspacePythonPath = path.join(
-			workspaceBinDir,
-			process.platform === "win32" ? "python.exe" : "python",
-		);
-		fs.mkdirSync(workspaceBinDir, { recursive: true });
-		fs.writeFileSync(workspacePythonPath, "");
+		createEnvironment(path.join(workspace.root, ".venv"));
 
 		const nested = path.join(workspace.root, "tools", "standalone");
-		const nestedTestFile = path.join(nested, "tests", "test_example.py");
-		fs.mkdirSync(path.dirname(nestedTestFile), { recursive: true });
-		fs.writeFileSync(nestedTestFile, "def test_example():\n    assert True\n");
+		const nestedTestFile = createTestFile(nested);
 		fs.writeFileSync(
 			path.join(nested, "pyproject.toml"),
 			"[project]\nname='standalone'\n",
 		);
-		const nestedBinDir = path.join(
-			nested,
-			".venv",
-			process.platform === "win32" ? "Scripts" : "bin",
-		);
-		const nestedPythonPath = path.join(
-			nestedBinDir,
-			process.platform === "win32" ? "python.exe" : "python",
-		);
-		fs.mkdirSync(nestedBinDir, { recursive: true });
-		fs.writeFileSync(nestedPythonPath, "");
+		const expected = createEnvironment(path.join(nested, ".venv"));
 
-		await new TestRunnerClient(false).runTestFileAsync(
-			nestedTestFile,
-			nested,
-			"pytest",
-			RUNNERS.pytest,
-		);
+		const { command, options } = await runPytest(nestedTestFile, nested);
 
-		const [command, , options] = safeSpawnAsync.mock.calls[0];
-		if (!options) throw new Error("pytest spawn options were not supplied");
-		expect(command).toBe(nestedPythonPath);
-		expect(options.env?.VIRTUAL_ENV).toBe(path.join(nested, ".venv"));
+		expect(command).toBe(expected.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(expected.root);
 	});
 
 	it("honors uv workspace exclusions over member globs", async () => {
@@ -316,52 +405,20 @@ describe("pytest project environment", () => {
 			path.join(workspace.root, "pyproject.toml"),
 			"[tool.uv.workspace]\nmembers = ['packages/*']\nexclude = ['packages/excluded']\n",
 		);
-		const workspaceBinDir = path.join(
-			workspace.root,
-			".venv",
-			process.platform === "win32" ? "Scripts" : "bin",
-		);
-		const workspacePythonPath = path.join(
-			workspaceBinDir,
-			process.platform === "win32" ? "python.exe" : "python",
-		);
-		fs.mkdirSync(workspaceBinDir, { recursive: true });
-		fs.writeFileSync(workspacePythonPath, "");
+		createEnvironment(path.join(workspace.root, ".venv"));
 
 		const excluded = path.join(workspace.root, "packages", "excluded");
-		const excludedTestFile = path.join(excluded, "tests", "test_example.py");
-		fs.mkdirSync(path.dirname(excludedTestFile), { recursive: true });
-		fs.writeFileSync(
-			excludedTestFile,
-			"def test_example():\n    assert True\n",
-		);
+		const excludedTestFile = createTestFile(excluded);
 		fs.writeFileSync(
 			path.join(excluded, "pyproject.toml"),
 			"[project]\nname='excluded'\n",
 		);
-		const excludedBinDir = path.join(
-			excluded,
-			".venv",
-			process.platform === "win32" ? "Scripts" : "bin",
-		);
-		const excludedPythonPath = path.join(
-			excludedBinDir,
-			process.platform === "win32" ? "python.exe" : "python",
-		);
-		fs.mkdirSync(excludedBinDir, { recursive: true });
-		fs.writeFileSync(excludedPythonPath, "");
+		const expected = createEnvironment(path.join(excluded, ".venv"));
 
-		await new TestRunnerClient(false).runTestFileAsync(
-			excludedTestFile,
-			excluded,
-			"pytest",
-			RUNNERS.pytest,
-		);
+		const { command, options } = await runPytest(excludedTestFile, excluded);
 
-		const [command, , options] = safeSpawnAsync.mock.calls[0];
-		if (!options) throw new Error("pytest spawn options were not supplied");
-		expect(command).toBe(excludedPythonPath);
-		expect(options.env?.VIRTUAL_ENV).toBe(path.join(excluded, ".venv"));
+		expect(command).toBe(expected.pythonPath);
+		expect(options.env?.VIRTUAL_ENV).toBe(expected.root);
 	});
 
 	it("labels pytest usage errors and interruptions by their real exit codes", () => {

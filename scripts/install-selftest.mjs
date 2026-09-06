@@ -17,7 +17,9 @@
  * Force-imports the modules whose TOP-LEVEL bare imports are the documented
  * failure points, plus the bare specifiers directly, and checks the two
  * build-script-provided assets (ast-grep CLI binary + tree-sitter grammars)
- * that pnpm/bun skip by default. It runs no model and needs no credentials.
+ * that pnpm/bun skip by default. It also resolves the `pi.skills` manifest
+ * entries the way pi does, from the installed package root (#2587). It runs no
+ * model and needs no credentials.
  *
  * WHAT IT NO LONGER COVERS (#1926)
  * pi supplies `typebox` and `@earendil-works/pi-tui` from its own runtime, so
@@ -241,6 +243,64 @@ try {
 	grammarDetail = `web-tree-sitter unresolved: ${err?.message || err}`;
 }
 record("tree-sitter grammars", "asset", hasCoreGrammar, grammarDetail);
+
+// --- 4. pi.skills manifest resolution, AS INSTALLED (#2587) ----------------
+// Guards the recurrence of #2587: a `pi.skills` entry that resolves outside the
+// installed package, so pi registers none of the shipped skills. This probe runs
+// from the INSTALLED package (`require.resolve("pi-lens/scripts/…")`), so it sees
+// the real layout — hoisted node_modules, pnpm's symlink store, bun, yarn — which
+// is exactly where `../../skills` escaped and where a static check on the source
+// tree cannot look. Replicates pi's own resolver, `PackageManager#collectFiles\
+// FromManifestEntries` in `@earendil-works/pi-coding-agent`
+// `dist/core/package-manager.js`: a non-glob entry is `resolve(packageRoot, entry)`
+// (verified identical in 0.78.1 / 0.84.1 / 0.85.1).
+/** How many SKILL.md files live under `dir` (0 if it does not exist). */
+function countSkillFiles(dir) {
+	let n = 0;
+	let entries;
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+	for (const e of entries) {
+		if (e.isDirectory()) n += countSkillFiles(path.join(dir, e.name));
+		else if (e.name === "SKILL.md") n++;
+	}
+	return n;
+}
+{
+	const pkgJson = JSON.parse(
+		fs.readFileSync(path.join(pkgRoot, "package.json"), "utf8"),
+	);
+	const entries = pkgJson.pi?.skills ?? [];
+	if (entries.length === 0) {
+		record("pi.skills declared", "manifest", false, "pi.skills is empty");
+	}
+	for (const entry of entries) {
+		const label = `pi.skills "${entry}"`;
+		// pi globs entries containing * or ? through a different branch; this
+		// probe only replicates the non-glob one.
+		if (/[*?]/.test(entry)) {
+			record(label, "manifest", true, "glob entry — not probed");
+			continue;
+		}
+		const resolved = path.resolve(pkgRoot, entry);
+		if (resolved !== pkgRoot && !resolved.startsWith(pkgRoot + path.sep)) {
+			record(label, "manifest", false, `escapes the package: ${resolved}`);
+			continue;
+		}
+		const found = countSkillFiles(resolved);
+		record(
+			label,
+			"manifest",
+			found > 0,
+			found > 0
+				? `${found} SKILL.md under ${resolved}`
+				: `no SKILL.md under ${resolved}`,
+		);
+	}
+}
 
 // --- Report ----------------------------------------------------------------
 const pad = Math.max(...results.map((r) => r.name.length));

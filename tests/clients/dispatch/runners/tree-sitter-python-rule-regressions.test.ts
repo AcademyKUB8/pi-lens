@@ -463,7 +463,15 @@ from sqlalchemy.orm import Session
 
 def find(db: Session = Depends(get_db)):
     stmt = select(User)
-    return db.scalars(stmt).all()
+    return db.execute(stmt).all()
+`,
+		);
+		const unprovableReceiver = env.addFile(
+			"sa-unprovable-receiver.py",
+			`from sqlalchemy import select
+
+def rows(conn):
+    return conn.execute(select(User))
 `,
 		);
 		const unannotatedReceiver = env.addFile(
@@ -488,8 +496,10 @@ def find(db: Session):
 			"db.scalar(select(User))": scalarSelect,
 			"await db.execute(select(User)) on AsyncSession": asyncExecuteSelect,
 			"stmt = select(User); db.execute(stmt)": boundStatement,
-			"db: Session = Depends(get_db); db.scalars(stmt)": fastApiDependency,
+			"db: Session = Depends(get_db); db.execute(stmt)": fastApiDependency,
 			"unannotated session.execute(stmt)": unannotatedReceiver,
+			"conn.execute(select(User)) on an unprovable receiver":
+				unprovableReceiver,
 			'db.execute(text("SELECT 1"))': staticText,
 		};
 		const results = await Promise.all(
@@ -548,8 +558,8 @@ def run(db: Session, statement):
 from sqlalchemy.orm import Session
 
 def find(db: Session, tainted):
-    stmt = select(User)
     stmt = tainted
+    stmt = select(User)
     return db.execute(stmt)
 `,
 		);
@@ -560,7 +570,7 @@ def find(db: Session, tainted):
 			'db.execute(text("..." + uid))': textConcat,
 			'db.execute(text("...".format(uid)))': textFormat,
 			"db.execute(opaque_parameter)": opaqueStatement,
-			"stmt rebound from select() to tainted": reboundStatement,
+			"stmt bound twice — tainted, then select()": reboundStatement,
 		};
 		const results = await Promise.all(
 			Object.entries(fixtures).map(async ([label, fixture]) => [

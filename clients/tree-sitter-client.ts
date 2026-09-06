@@ -65,7 +65,6 @@ import {
 	isSqlAlchemyStatementArgument,
 	PYTHON_SQLALCHEMY_RECEIVER_NAMES,
 	PYTHON_SQLALCHEMY_STATEMENT_BUILDERS,
-	PYTHON_SQLALCHEMY_STATEMENT_METHODS,
 } from "./python-provenance.js";
 import {
 	type TreeSitterQuery,
@@ -4140,13 +4139,13 @@ export class TreeSitterClient {
 				}
 
 				// #2576: a receiver PROVEN to be a sqlalchemy Session/AsyncSession.
-				// `Session.query` takes entity classes; the statement methods take a
-				// builder call or a name bound to one (`stmt = select(User)`), which
-				// the argument-position check above cannot see.
+				// `Session.query` takes entity classes; `Session.execute` takes a
+				// statement object — a builder call, or a name bound to one
+				// (`stmt = select(User)`), which the check above cannot see.
 				if (isProvenSqlAlchemySessionReceiver(receiver, rootNode)) {
 					if (fn === "query") return false;
 					if (
-						PYTHON_SQLALCHEMY_STATEMENT_METHODS.has(fn) &&
+						fn === "execute" &&
 						isSqlAlchemyStatementArgument(sqlNode, rootNode)
 					) {
 						return false;

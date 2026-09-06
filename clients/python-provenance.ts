@@ -77,10 +77,6 @@ export const PYTHON_SQLALCHEMY_RECEIVER_NAMES: ReadonlySet<string> = new Set([
 /** Statement constructors whose result is an expression object, never a string. */
 export const PYTHON_SQLALCHEMY_STATEMENT_BUILDERS: ReadonlySet<string> =
 	new Set(["select", "insert", "update", "delete"]);
-/** Session/AsyncSession methods that execute a statement object. */
-export const PYTHON_SQLALCHEMY_STATEMENT_METHODS: ReadonlySet<string> = new Set(
-	["execute", "scalar", "scalars"],
-);
 
 const FROM_IMPORT_PROVENANCE = new Map<string, PythonProvenance>([
 	["sqlalchemy.orm:Session", "sqlalchemy-session"],
